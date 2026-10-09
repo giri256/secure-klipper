@@ -11,8 +11,11 @@
 #include <QBindable>
 #include <QClipboard>
 #include <QDateTime>
+#include <QSet>
 #include <QSqlDatabase>
+#include <QTimer>
 
+#include "historyvault.h"
 #include "klipper_export.h"
 
 class KCoreConfigSkeleton;
@@ -31,9 +34,18 @@ public:
         TypeIntRole,
         ImageUrlRole,
         ImageSizeRole,
-        StarredRole
+        StarredRole,
+        EncryptedRole, ///< data lives in the history vault
+        LockedRole, ///< encrypted and the vault is locked: content unknown, hidden in the UI
     };
     Q_ENUM(RoleType)
+
+    enum class VaultOperation {
+        Setup,
+        Unlock,
+        ChangePassword,
+    };
+    Q_ENUM(VaultOperation)
 
     [[nodiscard]] static std::shared_ptr<HistoryModel> self();
     ~HistoryModel() override;
@@ -96,8 +108,36 @@ public:
 
     int pendingJobs() const;
 
+    /**
+     * History vault: when configured, only the newest plaintextItems() entries are kept
+     * in plaintext on disk, all older ones are encrypted (see HistoryVault).
+     */
+    bool isVaultConfigured() const;
+    bool isVaultUnlocked() const;
+    /// True while a slow (Argon2id) vault operation runs on a worker thread.
+    bool isVaultBusy() const;
+    /// Number of encrypted entries whose content is unavailable because the vault is locked.
+    int lockedCount() const;
+    qsizetype plaintextItems() const;
+    /// Asynchronous; emits vaultOperationFinished(Setup, ok).
+    void setupVault(const QString &password);
+    /// Asynchronous; emits vaultOperationFinished(Unlock, ok).
+    void unlockVault(const QString &password);
+    void lockVault();
+    /// Asynchronous; emits vaultOperationFinished(ChangePassword, ok).
+    void changeVaultPassword(const QString &oldPassword, const QString &newPassword);
+    /// Forgotten password: irrecoverably deletes all encrypted entries and the vault keys.
+    void resetVault();
+    /// Brings storage in line with the policy now (normally deferred to the event loop).
+    void enforceVault();
+
 Q_SIGNALS:
     void changed(bool isTop = false);
+
+    void vaultStateChanged();
+    void vaultOperationFinished(HistoryModel::VaultOperation operation, bool success);
+    /// The user tried to use an entry that needs the vault unlocked.
+    void unlockRequested();
 
     void actionInvoked(const std::shared_ptr<const HistoryItem> &item);
 
@@ -110,6 +150,7 @@ private Q_SLOTS:
 
     void slotIgnored(QClipboard::Mode mode);
     void slotReceivedEmptyClipboard(QClipboard::Mode mode);
+    void slotScreenSaverActiveChanged(bool active);
 
 private:
     explicit HistoryModel();
@@ -129,6 +170,16 @@ private:
      */
     bool isItemStarred(const QString &uuid) const;
 
+    void scheduleEnforceVault();
+    /// Encrypts the plain items at @p demoteRows and decrypts the unlocked encrypted items at
+    /// @p promoteRows, in one transaction. Returns false if nothing was changed.
+    bool applyVault(const QList<qsizetype> &demoteRows, const QList<qsizetype> &promoteRows);
+    /// Deletes folders (absolute paths) on a worker thread; counted in pendingJobs().
+    void removeFolders(const QStringList &paths);
+    QString dataFolder(const QString &uuid) const;
+    void setVaultBusy(bool busy);
+    void restartAutoLock();
+
     std::shared_ptr<SystemClipboard> m_clip;
     QList<std::shared_ptr<HistoryItem>> m_items;
     Q_OBJECT_BINDABLE_PROPERTY_WITH_ARGS(HistoryModel, int, m_starredCount, 0)
@@ -142,6 +193,14 @@ private:
     bool m_bKeepContents = true;
     bool m_bSynchronize = false;
     bool m_bSelectionTextOnly = true;
+
+    HistoryVault m_vault;
+    QSet<QString> m_pendingWrites; ///< uuids whose UpdateDatabaseJob is still running
+    qsizetype m_plaintextItems = 5;
+    bool m_enforceScheduled = false;
+    bool m_vaultBusy = false;
+    bool m_vacuumPending = false;
+    QTimer m_autoLockTimer;
 
     friend class DeclarativeHistoryModel;
     friend class HistoryModelTest;

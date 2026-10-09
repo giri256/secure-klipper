@@ -380,7 +380,10 @@ QStringList Klipper::getClipboardHistoryMenu()
 {
     QStringList menu;
     for (int i = 0, count = m_historyModel->rowCount(); i < count; ++i) {
-        menu.emplace_back(m_historyModel->index(i).data(Qt::DisplayRole).toString());
+        // Encrypted entries are not exposed over D-Bus, even while the vault is unlocked
+        if (const QModelIndex index = m_historyModel->index(i); !index.data(HistoryModel::EncryptedRole).toBool()) {
+            menu.emplace_back(index.data(Qt::DisplayRole).toString());
+        }
     }
 
     return menu;
@@ -388,6 +391,9 @@ QStringList Klipper::getClipboardHistoryMenu()
 
 QString Klipper::getClipboardHistoryItem(int i)
 {
+    if (const QModelIndex index = m_historyModel->index(i); index.data(HistoryModel::EncryptedRole).toBool()) {
+        return QString();
+    }
     return m_historyModel->index(i).data(Qt::DisplayRole).toString();
 }
 

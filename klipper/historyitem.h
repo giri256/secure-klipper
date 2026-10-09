@@ -8,6 +8,7 @@
 #include <memory>
 
 #include <QFlags>
+#include <QSize>
 #include <QString>
 
 #include "klipper_export.h"
@@ -81,8 +82,46 @@ public:
      */
     static HistoryItemPtr create(const QSqlQuery &query);
 
+    /**
+     * An item whose data lives encrypted in the history vault (see HistoryVault).
+     * @p uuid is the random storage id of the row; @p contentUuid the SHA1 of the
+     * content (used for de-duplication) and only known while unlocked.
+     */
+    static HistoryItemPtr createEncrypted(const QString &uuid,
+                                          const QString &contentUuid,
+                                          const QStringList &mimeTypes,
+                                          const QString &text,
+                                          const QSize &imageSize);
+    /// An encrypted item whose content is unknown because the vault is locked.
+    static HistoryItemPtr createLocked(const QString &uuid);
+
+    /// The mimetypes column value marking a row whose data is in the vault table.
+    static constexpr QLatin1StringView encryptedMimeType{"application/x-kde-klipper-encrypted"};
+
+    bool isEncrypted() const
+    {
+        return m_encrypted;
+    }
+    bool isLocked() const
+    {
+        return m_locked;
+    }
+    /// SHA1 of the content; equals uuid() for plain items, empty for locked items.
+    const QString &contentUuid() const
+    {
+        return m_contentUuid;
+    }
+    QSize imageSize() const
+    {
+        return m_imageSize;
+    }
+
 private:
     QString m_uuid;
     HistoryItemTypes m_types = HistoryItemType::Unknown;
     QString m_text;
+    QString m_contentUuid;
+    QSize m_imageSize;
+    bool m_encrypted = false;
+    bool m_locked = false;
 };

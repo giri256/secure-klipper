@@ -11,15 +11,21 @@
 #include <chrono>
 #include <zlib.h>
 
+#include <QBuffer>
 #include <QCryptographicHash>
+#include <QDBusConnection>
+#include <QDataStream>
 #include <QDir>
 #include <QFile>
+#include <QFutureWatcher>
 #include <QImageReader>
 #include <QMimeData>
+#include <QRandomGenerator>
 #include <QSaveFile>
 #include <QSqlError>
 #include <QSqlQuery>
 #include <QStandardPaths>
+#include <QtConcurrentRun>
 
 #include <KIO/DeleteJob>
 #include <KLocalizedString>
@@ -99,6 +105,70 @@ QString computeUuid(const QMimeData *data)
     }
     return QString::fromLatin1(hash.result().toHex());
 }
+
+// Storage id of an encrypted row. Random, so it does not reveal the content hash.
+QString randomUuid()
+{
+    quint32 words[5];
+    QRandomGenerator::system()->fillRange(words);
+    return QString::fromLatin1(QByteArray(reinterpret_cast<const char *>(words), sizeof words).toHex());
+}
+
+// Associated data binding each sealed blob to its row and purpose, so blobs can't be swapped between rows
+QByteArray metaAd(const QString &uuid)
+{
+    return "meta|" + uuid.toLatin1();
+}
+
+QByteArray payloadAd(const QString &uuid)
+{
+    return "payload|" + uuid.toLatin1();
+}
+
+constexpr quint8 s_vaultFormat = 1;
+
+// What the UI needs of an encrypted item; decrypted on unlock
+struct VaultMeta {
+    QString contentUuid;
+    QString mimeTypes;
+    QString text;
+    QSize imageSize;
+};
+
+QByteArray serializeMeta(const VaultMeta &meta)
+{
+    QByteArray data;
+    QDataStream out(&data, QIODevice::WriteOnly);
+    out.setVersion(QDataStream::Qt_6_5);
+    out << s_vaultFormat << meta.contentUuid << meta.mimeTypes << meta.text << meta.imageSize;
+    return data;
+}
+
+std::optional<VaultMeta> parseMeta(const QByteArray &data)
+{
+    QDataStream in(data);
+    in.setVersion(QDataStream::Qt_6_5);
+    quint8 format = 0;
+    VaultMeta meta;
+    in >> format >> meta.contentUuid >> meta.mimeTypes >> meta.text >> meta.imageSize;
+    if (format != s_vaultFormat || in.status() != QDataStream::Ok || meta.contentUuid.size() != 40) {
+        return std::nullopt;
+    }
+    return meta;
+}
+
+// The item's data: aux rows (mimetype -> data_uuid) and the data files' bytes (data_uuid -> bytes)
+using AuxRows = QList<std::pair<QString, QString>>;
+using Blobs = QHash<QString, QByteArray>;
+
+void restartIfNeeded(QTimer &timer, int minutes)
+{
+    if (minutes > 0) {
+        timer.start(std::chrono::minutes(minutes));
+    } else {
+        timer.stop();
+    }
+}
 }
 
 std::shared_ptr<HistoryModel> HistoryModel::self()
@@ -155,7 +225,7 @@ HistoryModel::HistoryModel()
             m_clip->clear(SystemClipboard::SelectionMode(SystemClipboard::Selection | SystemClipboard::Clipboard));
             return;
         }
-        if (!isTop) {
+        if (!isTop || m_items[0]->isEncrypted()) {
             return;
         }
 
@@ -172,6 +242,16 @@ HistoryModel::HistoryModel()
 
     connect(m_clip.get(), &SystemClipboard::ignored, this, &HistoryModel::slotIgnored);
     connect(m_clip.get(), &SystemClipboard::newClipData, this, &HistoryModel::checkClipData);
+
+    m_autoLockTimer.setSingleShot(true);
+    connect(&m_autoLockTimer, &QTimer::timeout, this, &HistoryModel::lockVault);
+    // Lock the vault together with the session. Empty service: accept the signal from whichever screen locker owns the name.
+    QDBusConnection::sessionBus().connect(QString(),
+                                          u"/ScreenSaver"_s,
+                                          u"org.freedesktop.ScreenSaver"_s,
+                                          u"ActiveChanged"_s,
+                                          this,
+                                          SLOT(slotScreenSaverActiveChanged(bool)));
 }
 
 HistoryModel::~HistoryModel()
@@ -188,20 +268,27 @@ void HistoryModel::clear()
     if (!m_db.isOpen()) {
         return;
     }
-    if (TransactionGuard transaction(&m_db); !transaction.exec(u"DELETE FROM main"_s) || !transaction.exec(u"DELETE FROM aux"_s)) {
+    if (TransactionGuard transaction(&m_db);
+        !transaction.exec(u"DELETE FROM main"_s) || !transaction.exec(u"DELETE FROM aux"_s) || !transaction.exec(u"DELETE FROM vault"_s)) {
         return;
     }
-    QList<QUrl> deletedDataFolders;
-    deletedDataFolders.reserve(m_items.size());
-    std::ranges::transform(m_items, std::back_inserter(deletedDataFolders), [this](const auto &item) {
-        return QUrl::fromLocalFile(m_dbFolder + u"/data/" + item->uuid() + u'/');
-    });
-    auto job = KIO::del(deletedDataFolders, KIO::HideProgressInfo);
-    ++m_pendingJobs;
-    connect(job, &KJob::finished, this, [this] {
-        --m_pendingJobs;
-    });
+    // Move the whole data folder aside and delete it in the background:
+    // KIO::del of a few thousand item folders used to take minutes.
+    const QString dataPath = m_dbFolder + u"/data";
+    const QString trashPath = m_dbFolder + u"/data.trash-" + randomUuid().left(8);
+    if (QDir().rename(dataPath, trashPath)) {
+        QDir().mkpath(dataPath);
+        QFile::setPermissions(dataPath, QFileDevice::ReadOwner | QFileDevice::WriteOwner | QFileDevice::ExeOwner);
+        removeFolders({trashPath});
+    } else {
+        QStringList folders;
+        for (const auto &item : std::as_const(m_items)) {
+            folders.append(dataFolder(item->uuid()));
+        }
+        removeFolders(folders);
+    }
     QSqlQuery(u"VACUUM"_s, m_db).exec();
+    QSqlQuery(u"PRAGMA wal_checkpoint(TRUNCATE)"_s, m_db).exec();
     if (!m_items.empty()) { // Is empty when m_bKeepContents is false
         beginResetModel();
         m_items.clear();
@@ -244,32 +331,36 @@ void HistoryModel::clearNonStarredHistory()
         if (!transaction.exec(u"DELETE FROM aux WHERE uuid IN (%1)"_s.arg(uuidList))) {
             return;
         }
+        if (!transaction.exec(u"DELETE FROM vault WHERE uuid IN (%1)"_s.arg(uuidList))) {
+            return;
+        }
     }
 
     // Delete associated data folders
-    QList<QUrl> deletedDataFolders;
+    QStringList deletedDataFolders;
     deletedDataFolders.reserve(nonStarredUuids.size());
     for (const QString &uuid : std::as_const(nonStarredUuids)) {
-        deletedDataFolders.append(QUrl::fromLocalFile(m_dbFolder + u"/data/" + uuid + u'/'));
+        deletedDataFolders.append(dataFolder(uuid));
     }
-    auto job = KIO::del(deletedDataFolders, KIO::HideProgressInfo);
-    ++m_pendingJobs;
-    connect(job, &KJob::finished, this, [this] {
-        --m_pendingJobs;
-    });
+    removeFolders(deletedDataFolders);
+
+    // Removing items from a list one by one is quadratic; look them up in a set
+    const QSet<QString> removedUuids(nonStarredUuids.cbegin(), nonStarredUuids.cend());
 
     // Remove items from the model that were deleted
     // We need to work backwards to maintain correct indices
     beginResetModel();
     for (qsizetype i = m_items.size() - 1; i >= 0; --i) {
-        if (nonStarredUuids.contains(m_items[i]->uuid())) {
+        if (removedUuids.contains(m_items[i]->uuid())) {
             m_items.removeAt(i);
         }
     }
     endResetModel();
 
     QSqlQuery(u"VACUUM"_s, m_db).exec();
+    QSqlQuery(u"PRAGMA wal_checkpoint(TRUNCATE)"_s, m_db).exec();
     m_clip->clear(SystemClipboard::SelectionMode(SystemClipboard::Selection | SystemClipboard::Clipboard));
+    Q_EMIT vaultStateChanged();
 }
 
 void HistoryModel::clearHistory()
@@ -304,31 +395,30 @@ void HistoryModel::setMaxSize(qsizetype size)
     m_maxSize = size;
     if (m_items.size() > m_maxSize) {
         // Remove non-starred items from the end until we're within the size limit
-        // or until no more non-starred items are available
-        // TODO: Consider adding a separate maxStarredItems setting in the future
-        // to prevent starred items from causing unlimited history growth
-        qsizetype itemsToRemove = m_items.size() - m_maxSize;
-        qsizetype removedCount = 0;
-
-        for (qsizetype i = m_items.size() - 1; i >= 0 && removedCount < itemsToRemove; --i) {
-            // Check if item is starred
-            QSqlQuery query(m_db);
-            query.prepare(u"SELECT starred FROM main WHERE uuid = ?"_s);
-            query.addBindValue(m_items[i]->uuid());
-            bool isStarred = false;
-            if (query.exec() && query.isSelect() && query.next()) {
-                isStarred = query.value(0).toBool();
-            }
-
-            if (!isStarred) {
-                removeRow(i);
-                removedCount++;
-                // Note: After removeRow, indices shift, but since we're going backwards
-                // and only removing from the current position, this is safe
+        // or until no more non-starred items are available. Starred items are protected,
+        // so the history may exceed maxSize.
+        // Batched: one starred lookup, then one removeRows() per contiguous run instead of
+        // per-row SQL + per-row KIO jobs (shrinking 5000 -> 20 took over a minute).
+        QSet<QString> starred;
+        if (QSqlQuery query(m_db); query.exec(u"SELECT uuid FROM main WHERE starred = 1"_s)) {
+            while (query.next()) {
+                starred.insert(query.value(0).toString());
             }
         }
-        // If we couldn't remove enough non-starred items, the history may exceed maxSize
-        // This is acceptable as starred items are protected
+        qsizetype toRemove = m_items.size() - m_maxSize;
+        qsizetype i = m_items.size() - 1;
+        while (i >= 0 && toRemove > 0) {
+            if (starred.contains(m_items[i]->uuid())) {
+                --i;
+                continue;
+            }
+            const qsizetype last = i;
+            while (i >= 0 && toRemove > 0 && !starred.contains(m_items[i]->uuid())) {
+                --i;
+                --toRemove;
+            }
+            removeRows(i + 1, last - i);
+        }
     }
 }
 
@@ -353,6 +443,29 @@ QVariant HistoryModel::data(const QModelIndex &index, int role) const
 
     Q_ASSERT_X(m_db.isOpen(), Q_FUNC_INFO, qPrintable(m_db.lastError().text()));
     const std::shared_ptr<HistoryItem> &item = m_items.at(index.row());
+
+    if (item->isEncrypted()) {
+        switch (role) {
+        case Qt::DisplayRole:
+            if (item->isLocked()) {
+                return QString();
+            }
+            if (const QSize size = item->imageSize(); size.isValid() && item->text().isEmpty()) {
+                return QString(u"▨ " + i18nc("@info:tooltip width x height", "%1x%2", QString::number(size.width()), QString::number(size.height())));
+            }
+            return item->text();
+        case ImageUrlRole:
+            return QUrl(); // never written to disk in plaintext
+        case ImageSizeRole:
+            return item->imageSize();
+        case TypeRole:
+            return QVariant::fromValue<HistoryItemType>(HistoryItemType::Text);
+        case TypeIntRole:
+            return int(HistoryItemType::Text);
+        default:
+            break;
+        }
+    }
 
     switch (role) {
     case Qt::DisplayRole: {
@@ -397,6 +510,10 @@ QVariant HistoryModel::data(const QModelIndex &index, int role) const
         // TODO: Consider adding QHash<QString, bool> cache for starred status to avoid
         // frequent database queries if performance becomes an issue with large histories
         return isItemStarred(item->uuid());
+    case EncryptedRole:
+        return item->isEncrypted();
+    case LockedRole:
+        return item->isLocked();
     }
     return {};
 }
@@ -410,7 +527,7 @@ bool HistoryModel::setData(const QModelIndex &index, const QVariant &value, int 
 
     switch (auto &item = m_items[index.row()]; role) {
     case Qt::DisplayRole: {
-        if (item->type() != HistoryItemType::Text || !value.canConvert<QString>()) [[unlikely]] {
+        if (item->isEncrypted() || item->type() != HistoryItemType::Text || !value.canConvert<QString>()) [[unlikely]] {
             return false;
         }
         QString text = value.toString();
@@ -507,23 +624,27 @@ bool HistoryModel::removeRows(int row, int count, const QModelIndex &parent)
         if (!transaction.exec(u"DELETE FROM aux WHERE uuid IN (%1)"_s.arg(uuids))) {
             return false;
         }
+        if (!transaction.exec(u"DELETE FROM vault WHERE uuid IN (%1)"_s.arg(uuids))) {
+            return false;
+        }
     }
 
-    QList<QUrl> deletedDataFolders;
+    QStringList deletedDataFolders;
     deletedDataFolders.reserve(count);
     for (int i = 0; i < count; ++i) {
-        deletedDataFolders.append(QUrl::fromLocalFile(m_dbFolder + u"/data/" + m_items[row + i]->uuid() + u'/'));
+        if (const auto &item = m_items[row + i]; !item->isEncrypted()) { // encrypted items have no data folder
+            deletedDataFolders.append(dataFolder(item->uuid()));
+        }
     }
-    auto job = KIO::del(deletedDataFolders, KIO::HideProgressInfo);
-    ++m_pendingJobs;
-    connect(job, &KJob::finished, this, [this] {
-        --m_pendingJobs;
-    });
+    removeFolders(deletedDataFolders);
 
     beginRemoveRows(QModelIndex(), row, row + count - 1);
     m_items.erase(first, last);
     m_starredCount = newStarredCount;
     endRemoveRows();
+    // Older entries moved up; some may now belong in the plaintext window
+    scheduleEnforceVault();
+    Q_EMIT vaultStateChanged(); // lockedCount may have changed
     return true;
 }
 
@@ -555,8 +676,9 @@ bool HistoryModel::remove(const QString &uuid)
 
 int HistoryModel::indexOf(const QString &uuid) const
 {
+    // Also match the content hash of unlocked encrypted items, so a re-copied entry is found
     auto it = std::ranges::find_if(m_items, [&uuid](const auto &item) {
-        return item->uuid() == uuid;
+        return item->uuid() == uuid || item->contentUuid() == uuid;
     });
     return it == m_items.cend() ? -1 : std::distance(m_items.cbegin(), it);
 }
@@ -571,7 +693,7 @@ int HistoryModel::indexOf(const HistoryItem *item) const
 
 HistoryItemConstPtr HistoryModel::first() const
 {
-    if (m_items.empty()) {
+    if (m_items.empty() || m_items[0]->isEncrypted()) {
         return {};
     }
     return m_items[0];
@@ -655,10 +777,14 @@ bool HistoryModel::insert(const QMimeData *mimeData, qreal timestamp)
     }
 
     ++m_pendingJobs;
-    connect(updateJob, &KJob::finished, this, [this] {
+    m_pendingWrites.insert(uuid);
+    connect(updateJob, &KJob::finished, this, [this, uuid] {
         --m_pendingJobs;
+        m_pendingWrites.remove(uuid);
+        scheduleEnforceVault(); // the item can only be encrypted once it is fully written
     });
     updateJob->start();
+    scheduleEnforceVault();
 
     return true;
 }
@@ -681,6 +807,16 @@ bool HistoryModel::loadHistory()
     }
     QDir dataDir(m_dbFolder + u"/data");
     dataDir.mkpath(dataDir.absolutePath());
+    // Clipboard contents are private: owner-only access (stock Klipper leaves 0755/0644)
+    constexpr auto privateDir = QFileDevice::ReadOwner | QFileDevice::WriteOwner | QFileDevice::ExeOwner;
+    if (!qEnvironmentVariableIsSet("KLIPPER_DATABASE")) {
+        QFile::setPermissions(m_dbFolder, privateDir);
+    }
+    QFile::setPermissions(dataDir.absolutePath(), privateDir);
+    // Leftovers of an interrupted clear()
+    for (const QString &trash : QDir(m_dbFolder).entryList({u"data.trash-*"_s}, QDir::Dirs | QDir::NoDotAndDotDot)) {
+        QDir(m_dbFolder + u'/' + trash).removeRecursively();
+    }
 
     // Try to reuse the previous connection
     m_db = QSqlDatabase::database(u"klipper"_s);
@@ -697,9 +833,16 @@ bool HistoryModel::loadHistory()
         qCWarning(KLIPPER_LOG) << failedLoadWarning << m_db.lastError().text();
         return false;
     }
+    for (const QString &suffix : {u""_s, u"-wal"_s, u"-shm"_s}) {
+        if (QFile::exists(m_db.databaseName() + suffix)) {
+            QFile::setPermissions(m_db.databaseName() + suffix, QFileDevice::ReadOwner | QFileDevice::WriteOwner);
+        }
+    }
 
     QSqlQuery query(m_db);
     query.exec(u"PRAGMA journal_mode=WAL"_s);
+    // Overwrite deleted content with zeros, so plaintext of encrypted or removed entries does not linger in free pages
+    query.exec(u"PRAGMA secure_delete=ON"_s);
     // The main table only stores text data
     query.exec(
         u"CREATE TABLE IF NOT EXISTS main (uuid char(40) PRIMARY KEY, added_time REAL NOT NULL CHECK (added_time > 0), last_used_time REAL CHECK (last_used_time > 0), mimetypes TEXT NOT NULL, text NTEXT, starred BOOLEAN)"_s);
@@ -716,11 +859,18 @@ bool HistoryModel::loadHistory()
         qCWarning(KLIPPER_LOG) << failedLoadWarning << m_db.lastError().text();
         return false;
     }
+    // Vault tables are additive (db_version stays 3), so stock Klipper still opens the database;
+    // it then shows encrypted entries as empty text items.
+    if (!m_vault.load(m_db)) {
+        qCWarning(KLIPPER_LOG) << "History encryption is unavailable";
+    }
+    m_autoLockTimer.stop();
 
     if (!m_bKeepContents) {
         QSqlQuery clearQuery(m_db);
         clearQuery.exec(u"DELETE FROM main"_s);
         clearQuery.exec(u"DELETE FROM aux"_s);
+        clearQuery.exec(u"DELETE FROM vault"_s);
         clearQuery.exec(u"VACUUM"_s);
         if (dataDir.exists()) {
             dataDir.removeRecursively();
@@ -746,7 +896,14 @@ bool HistoryModel::loadHistory()
     }
 
     if (items.empty()) {
-        // special case - nothing to insert
+        // special case - nothing to insert, but don't keep showing stale items from a previous load
+        if (!m_items.empty()) {
+            beginResetModel();
+            m_items.clear();
+            m_starredCount = 0;
+            endResetModel();
+        }
+        Q_EMIT vaultStateChanged();
         return true;
     }
 
@@ -755,7 +912,12 @@ bool HistoryModel::loadHistory()
     m_starredCount = starredCount;
     endResetModel();
 
-    m_clip->setMimeData(m_items[0], SystemClipboard::SelectionMode(SystemClipboard::Clipboard | SystemClipboard::Selection));
+    if (!m_items[0]->isEncrypted()) {
+        m_clip->setMimeData(m_items[0], SystemClipboard::SelectionMode(SystemClipboard::Clipboard | SystemClipboard::Selection));
+    }
+    Q_EMIT vaultStateChanged();
+    // e.g. entries written by stock Klipper while this build wasn't running
+    scheduleEnforceVault();
 
     return true;
 }
@@ -776,6 +938,13 @@ void HistoryModel::loadSettings()
     m_bKeepContents = KlipperSettings::keepClipboardContents();
     m_bSynchronize = KlipperSettings::syncClipboards();
     m_bSelectionTextOnly = KlipperSettings::selectionTextOnly();
+    if (const qsizetype plaintextItems = KlipperSettings::plaintextHistoryItems(); plaintextItems != m_plaintextItems) {
+        m_plaintextItems = plaintextItems;
+        scheduleEnforceVault();
+    }
+    if (m_vault.isUnlocked()) {
+        restartAutoLock();
+    }
 
     if (m_bNoNullClipboard) {
         connect(m_clip.get(), &SystemClipboard::receivedEmptyClipboard, this, &HistoryModel::slotReceivedEmptyClipboard, Qt::UniqueConnection);
@@ -815,6 +984,28 @@ void HistoryModel::moveToTop(qsizetype row)
         Q_ASSERT_X(false, Q_FUNC_INFO, std::to_string(row).c_str());
         return;
     }
+    if (const HistoryItemPtr item = m_items[row]; item->isEncrypted()) {
+        if (item->isLocked()) {
+            Q_EMIT unlockRequested();
+            return;
+        }
+        // Copied again while the vault was locked: keep the plain copy, drop the encrypted one
+        auto plainCopy = std::ranges::find_if(m_items, [&item](const auto &other) {
+            return !other->isEncrypted() && other->uuid() == item->contentUuid();
+        });
+        if (plainCopy != m_items.cend()) {
+            const QString plainUuid = (*plainCopy)->uuid();
+            removeRow(row);
+            moveToTop(indexOf(plainUuid));
+            return;
+        }
+        // Decrypt back into a normal entry so it can be put on the clipboard
+        if (!applyVault({}, {row}) || m_items[row]->isEncrypted()) {
+            qCWarning(KLIPPER_LOG) << "Failed to decrypt history entry";
+            return;
+        }
+    }
+    scheduleEnforceVault(); // the item it displaces may leave the plaintext window
     if (row == 0) {
         // The item is already at the top, but it still may be not be set as the actual clipboard
         // contents, normally this happens if the item is only in the X11 mouse selection but
@@ -842,17 +1033,21 @@ void HistoryModel::saveToFile(QStringView dbFolder, const QByteArray &data, QStr
 
 void HistoryModel::moveTopToBack()
 {
-    if (m_items.size() < 2) {
+    if (m_items.size() < 2 || m_items[1]->isLocked()) { // would put an unreadable item on the clipboard
         return;
     }
     beginMoveRows(QModelIndex(), 0, 0, QModelIndex(), m_items.size());
     auto item = m_items.takeFirst();
     m_items.append(item);
     endMoveRows();
+    scheduleEnforceVault();
 }
 
 void HistoryModel::moveBackToTop()
 {
+    if (m_items.empty() || m_items.constLast()->isLocked()) {
+        return;
+    }
     moveToTop(m_items.size() - 1);
 }
 
@@ -865,6 +1060,8 @@ QHash<int, QByteArray> HistoryModel::roleNames() const
     hash.insert(UuidRole, QByteArrayLiteral("uuid"));
     hash.insert(TypeIntRole, QByteArrayLiteral("type"));
     hash.insert(StarredRole, QByteArrayLiteral("starred"));
+    hash.insert(EncryptedRole, QByteArrayLiteral("encrypted"));
+    hash.insert(LockedRole, QByteArrayLiteral("locked"));
     return hash;
 }
 
@@ -937,6 +1134,484 @@ bool HistoryModel::isItemStarred(const QString &uuid) const
         return query.value(0).toBool();
     }
     return false;
+}
+
+QString HistoryModel::dataFolder(const QString &uuid) const
+{
+    return m_dbFolder + u"/data/" + uuid;
+}
+
+void HistoryModel::removeFolders(const QStringList &paths)
+{
+    if (paths.empty()) {
+        return;
+    }
+    ++m_pendingJobs;
+    auto watcher = new QFutureWatcher<void>(this);
+    connect(watcher, &QFutureWatcher<void>::finished, this, [this, watcher] {
+        --m_pendingJobs;
+        watcher->deleteLater();
+    });
+    watcher->setFuture(QtConcurrent::run([paths] {
+        for (const QString &path : paths) {
+            QDir(path).removeRecursively();
+        }
+    }));
+}
+
+bool HistoryModel::isVaultConfigured() const
+{
+    return m_vault.isConfigured();
+}
+
+bool HistoryModel::isVaultUnlocked() const
+{
+    return m_vault.isUnlocked();
+}
+
+bool HistoryModel::isVaultBusy() const
+{
+    return m_vaultBusy;
+}
+
+int HistoryModel::lockedCount() const
+{
+    return std::ranges::count_if(m_items, [](const auto &item) {
+        return item->isLocked();
+    });
+}
+
+qsizetype HistoryModel::plaintextItems() const
+{
+    return m_plaintextItems;
+}
+
+void HistoryModel::setVaultBusy(bool busy)
+{
+    if (m_vaultBusy != busy) {
+        m_vaultBusy = busy;
+        Q_EMIT vaultStateChanged();
+    }
+}
+
+void HistoryModel::restartAutoLock()
+{
+    restartIfNeeded(m_autoLockTimer, m_vault.isUnlocked() ? KlipperSettings::vaultAutoLockMinutes() : 0);
+}
+
+void HistoryModel::slotScreenSaverActiveChanged(bool active)
+{
+    if (active) {
+        lockVault();
+    }
+}
+
+void HistoryModel::scheduleEnforceVault()
+{
+    if (m_enforceScheduled || !m_vault.isConfigured()) {
+        return;
+    }
+    m_enforceScheduled = true;
+    QMetaObject::invokeMethod(this, &HistoryModel::enforceVault, Qt::QueuedConnection);
+}
+
+void HistoryModel::enforceVault()
+{
+    m_enforceScheduled = false;
+    if (!m_vault.isConfigured() || !m_db.isOpen() || m_vaultBusy) {
+        return;
+    }
+
+    // Duplicates can appear when an entry is copied again while its older copy is locked
+    if (m_vault.isUnlocked()) {
+        QSet<QString> seen;
+        for (qsizetype i = 0; i < m_items.size();) {
+            const QString &contentUuid = m_items[i]->contentUuid();
+            if (!contentUuid.isEmpty() && seen.contains(contentUuid)) {
+                removeRow(i);
+                continue;
+            }
+            seen.insert(contentUuid);
+            ++i;
+        }
+    }
+
+    // Policy: the newest m_plaintextItems entries are plain, everything older is encrypted.
+    // Work in batches so a first-time setup over thousands of entries keeps the UI responsive.
+    constexpr qsizetype batchSize = 200;
+    QList<qsizetype> demoteRows;
+    QList<qsizetype> promoteRows;
+    for (qsizetype i = 0; i < m_items.size() && demoteRows.size() + promoteRows.size() < batchSize; ++i) {
+        const auto &item = m_items[i];
+        if (i < m_plaintextItems) {
+            if (item->isEncrypted() && !item->isLocked()) {
+                promoteRows.append(i);
+            }
+        } else if (!item->isEncrypted() && !m_pendingWrites.contains(item->uuid())) {
+            demoteRows.append(i);
+        }
+    }
+    const bool batchFull = demoteRows.size() + promoteRows.size() >= batchSize;
+    const bool changedSomething = applyVault(demoteRows, promoteRows);
+    if (batchFull && changedSomething) {
+        scheduleEnforceVault();
+        return;
+    }
+    if (m_vacuumPending) {
+        // First setup over an existing history: rebuild the file so no page still holds old plaintext
+        m_vacuumPending = false;
+        QSqlQuery(u"VACUUM"_s, m_db).exec();
+        QSqlQuery(u"PRAGMA wal_checkpoint(TRUNCATE)"_s, m_db).exec();
+    }
+}
+
+bool HistoryModel::applyVault(const QList<qsizetype> &demoteRows, const QList<qsizetype> &promoteRows)
+{
+    if (!m_vault.isConfigured() || (demoteRows.empty() && promoteRows.empty())) {
+        return false;
+    }
+
+    QList<std::pair<qsizetype, HistoryItemPtr>> replacements;
+    QStringList obsoleteFolders; // plaintext data of demoted items, deleted after commit
+    QStringList writtenFolders; // data of promoted items, deleted again on rollback
+    bool ok = false;
+    {
+        TransactionGuard transaction(&m_db);
+
+        for (const qsizetype row : demoteRows) {
+            const HistoryItemPtr item = m_items[row];
+            const QString oldUuid = item->uuid();
+            QSqlQuery query(m_db);
+            query.prepare(u"SELECT mimetypes, text FROM main WHERE uuid=?"_s);
+            query.addBindValue(oldUuid);
+            if (!query.exec() || !query.next()) {
+                continue; // not (or no longer) in the database
+            }
+            VaultMeta meta{oldUuid, query.value(0).toString(), query.value(1).toString(), {}};
+
+            AuxRows auxRows;
+            Blobs blobs;
+            query.prepare(u"SELECT mimetype, data_uuid FROM aux WHERE uuid=?"_s);
+            query.addBindValue(oldUuid);
+            query.exec();
+            while (query.next()) {
+                const QString mimeType = query.value(0).toString();
+                const QString dataUuid = query.value(1).toString();
+                auxRows.emplace_back(mimeType, dataUuid);
+                if (!blobs.contains(dataUuid)) {
+                    QFile file(dataFolder(oldUuid) + u'/' + dataUuid);
+                    blobs.insert(dataUuid, file.open(QIODevice::ReadOnly) ? file.readAll() : QByteArray());
+                }
+                if (mimeType == s_imageFormat) {
+                    QBuffer buffer(&blobs[dataUuid]);
+                    buffer.open(QIODevice::ReadOnly);
+                    meta.imageSize = QImageReader(&buffer).size();
+                }
+            }
+
+            QByteArray payload;
+            {
+                QDataStream out(&payload, QIODevice::WriteOnly);
+                out.setVersion(QDataStream::Qt_6_5);
+                out << s_vaultFormat << auxRows << blobs;
+            }
+            for (QByteArray &blob : blobs) {
+                HistoryVault::wipe(blob);
+            }
+            QByteArray metaData = serializeMeta(meta);
+
+            const QString newUuid = randomUuid();
+            const QByteArray sealedMeta = m_vault.seal(metaData, metaAd(newUuid));
+            const QByteArray sealedPayload = m_vault.seal(payload, payloadAd(newUuid));
+            HistoryVault::wipe(metaData);
+            HistoryVault::wipe(payload);
+            if (sealedMeta.isEmpty() || sealedPayload.isEmpty()) {
+                break;
+            }
+
+            QSqlQuery insert(m_db);
+            insert.prepare(u"INSERT INTO vault (uuid, meta, payload) VALUES (?, ?, ?)"_s);
+            insert.addBindValue(newUuid);
+            insert.addBindValue(sealedMeta);
+            insert.addBindValue(sealedPayload);
+            QSqlQuery update(m_db);
+            update.prepare(u"UPDATE main SET uuid=?, mimetypes=?, text=NULL WHERE uuid=?"_s);
+            update.addBindValue(newUuid);
+            update.addBindValue(QString(HistoryItem::encryptedMimeType));
+            update.addBindValue(oldUuid);
+            QSqlQuery deleteAux(m_db);
+            deleteAux.prepare(u"DELETE FROM aux WHERE uuid=?"_s);
+            deleteAux.addBindValue(oldUuid);
+            if (!transaction.exec(insert) || !transaction.exec(update) || !transaction.exec(deleteAux)) {
+                break;
+            }
+            obsoleteFolders.append(dataFolder(oldUuid));
+            replacements.emplace_back(row,
+                                      m_vault.isUnlocked()
+                                          ? HistoryItem::createEncrypted(newUuid, oldUuid, meta.mimeTypes.split(u','), meta.text, meta.imageSize)
+                                          : HistoryItem::createLocked(newUuid));
+        }
+
+        for (const qsizetype row : promoteRows) {
+            const HistoryItemPtr item = m_items[row];
+            if (!item->isEncrypted() || item->isLocked() || !transaction.committed) {
+                continue;
+            }
+            const QString oldUuid = item->uuid();
+            QSqlQuery query(m_db);
+            query.prepare(u"SELECT meta, payload FROM vault WHERE uuid=?"_s);
+            query.addBindValue(oldUuid);
+            if (!query.exec() || !query.next()) {
+                continue;
+            }
+            std::optional<QByteArray> metaData = m_vault.open(query.value(0).toByteArray(), metaAd(oldUuid));
+            std::optional<QByteArray> payload = m_vault.open(query.value(1).toByteArray(), payloadAd(oldUuid));
+            const std::optional<VaultMeta> meta = metaData ? parseMeta(*metaData) : std::nullopt;
+            if (!meta || !payload) {
+                qCWarning(KLIPPER_LOG) << "Encrypted history entry failed authentication" << oldUuid;
+                continue;
+            }
+            quint8 format = 0;
+            AuxRows auxRows;
+            Blobs blobs;
+            {
+                QDataStream in(*payload);
+                in.setVersion(QDataStream::Qt_6_5);
+                in >> format >> auxRows >> blobs;
+                if (format != s_vaultFormat || in.status() != QDataStream::Ok) {
+                    continue;
+                }
+            }
+            HistoryVault::wipe(*payload);
+            HistoryVault::wipe(*metaData);
+
+            const QString &contentUuid = meta->contentUuid;
+            for (auto it = blobs.begin(); it != blobs.end(); ++it) {
+                saveToFile(m_dbFolder, it.value(), contentUuid, it.key());
+                HistoryVault::wipe(it.value());
+            }
+            writtenFolders.append(dataFolder(contentUuid));
+
+            for (const auto &[mimeType, dataUuid] : std::as_const(auxRows)) {
+                QSqlQuery insert(m_db);
+                insert.prepare(u"INSERT INTO aux (uuid, mimetype, data_uuid) VALUES (?, ?, ?)"_s);
+                insert.addBindValue(contentUuid);
+                insert.addBindValue(mimeType);
+                insert.addBindValue(dataUuid);
+                transaction.exec(insert);
+            }
+            QSqlQuery update(m_db);
+            update.prepare(u"UPDATE main SET uuid=?, mimetypes=?, text=? WHERE uuid=?"_s);
+            update.addBindValue(contentUuid);
+            update.addBindValue(meta->mimeTypes);
+            update.addBindValue(meta->text);
+            update.addBindValue(oldUuid);
+            QSqlQuery deleteVault(m_db);
+            deleteVault.prepare(u"DELETE FROM vault WHERE uuid=?"_s);
+            deleteVault.addBindValue(oldUuid);
+            if (!transaction.exec(update) || !transaction.exec(deleteVault)) {
+                break;
+            }
+            replacements.emplace_back(row, std::make_shared<HistoryItem>(contentUuid, meta->mimeTypes.split(u','), meta->text));
+        }
+
+        ok = transaction.inited && transaction.committed;
+    }
+
+    if (!ok) {
+        removeFolders(writtenFolders);
+        return false;
+    }
+    removeFolders(obsoleteFolders);
+    for (auto &[row, item] : replacements) {
+        m_items[row] = std::move(item);
+        // UuidRole: lets the top entry be re-applied to the clipboard once it is decrypted
+        Q_EMIT dataChanged(index(row),
+                           index(row),
+                           {Qt::DisplayRole, UuidRole, TypeRole, TypeIntRole, ImageUrlRole, ImageSizeRole, EncryptedRole, LockedRole});
+    }
+    if (!demoteRows.empty()) {
+        // The WAL still holds the plaintext pages we just replaced; fold it into the (secure_delete) main file and truncate it
+        QSqlQuery(u"PRAGMA wal_checkpoint(TRUNCATE)"_s, m_db).exec();
+    }
+    if (!replacements.empty()) {
+        Q_EMIT vaultStateChanged();
+    }
+    return !replacements.empty();
+}
+
+void HistoryModel::setupVault(const QString &password)
+{
+    if (m_vault.isConfigured() || m_vaultBusy || password.isEmpty() || !m_db.isOpen()) {
+        Q_EMIT vaultOperationFinished(VaultOperation::Setup, false);
+        return;
+    }
+    setVaultBusy(true);
+    auto watcher = new QFutureWatcher<std::optional<HistoryVault::NewKeys>>(this);
+    connect(watcher, &QFutureWatcherBase::finished, this, [this, watcher] {
+        std::optional<HistoryVault::NewKeys> keys = watcher->result();
+        watcher->deleteLater();
+        setVaultBusy(false);
+        const bool ok = keys && m_vault.install(m_db, std::move(*keys));
+        if (ok) {
+            m_vacuumPending = true;
+            restartAutoLock();
+            scheduleEnforceVault();
+        }
+        Q_EMIT vaultStateChanged();
+        Q_EMIT vaultOperationFinished(VaultOperation::Setup, ok);
+    });
+    watcher->setFuture(QtConcurrent::run([password = password.toUtf8()]() mutable {
+        return HistoryVault::createKeys(std::move(password));
+    }));
+}
+
+void HistoryModel::unlockVault(const QString &password)
+{
+    if (!m_vault.isConfigured() || m_vault.isUnlocked() || m_vaultBusy) {
+        Q_EMIT vaultOperationFinished(VaultOperation::Unlock, m_vault.isUnlocked());
+        return;
+    }
+    QList<std::pair<QString, QByteArray>> sealedMetas;
+    if (QSqlQuery query(m_db); query.exec(u"SELECT uuid, meta FROM vault"_s)) {
+        while (query.next()) {
+            sealedMetas.emplace_back(query.value(0).toString(), query.value(1).toByteArray());
+        }
+    }
+
+    struct Result {
+        HistoryVault::SecretKey secretKey;
+        QHash<QString, VaultMeta> metas;
+    };
+    setVaultBusy(true);
+    auto watcher = new QFutureWatcher<Result>(this);
+    connect(watcher, &QFutureWatcherBase::finished, this, [this, watcher] {
+        Result result = watcher->result();
+        watcher->deleteLater();
+        setVaultBusy(false);
+        if (!result.secretKey) {
+            Q_EMIT vaultOperationFinished(VaultOperation::Unlock, false);
+            return;
+        }
+        m_vault.setSecretKey(std::move(result.secretKey));
+        for (auto &item : m_items) {
+            if (!item->isLocked()) {
+                continue;
+            }
+            if (auto it = result.metas.constFind(item->uuid()); it != result.metas.cend()) {
+                item = HistoryItem::createEncrypted(item->uuid(), it->contentUuid, it->mimeTypes.split(u','), it->text, it->imageSize);
+            }
+        }
+        if (!m_items.empty()) {
+            Q_EMIT dataChanged(index(0), index(m_items.size() - 1), {Qt::DisplayRole, TypeRole, TypeIntRole, ImageSizeRole, EncryptedRole, LockedRole});
+        }
+        restartAutoLock();
+        Q_EMIT vaultStateChanged();
+        Q_EMIT vaultOperationFinished(VaultOperation::Unlock, true);
+        scheduleEnforceVault();
+    });
+    // Argon2id and the per-entry decryption run off the GUI thread
+    watcher->setFuture(QtConcurrent::run([params = m_vault.params(), password = password.toUtf8(), sealedMetas = std::move(sealedMetas)]() mutable {
+        Result result;
+        result.secretKey = HistoryVault::unwrapSecretKey(params, std::move(password));
+        if (!result.secretKey) {
+            return result;
+        }
+        for (const auto &[uuid, sealed] : std::as_const(sealedMetas)) {
+            std::optional<QByteArray> plain = HistoryVault::open(result.secretKey, params.publicKey, sealed, metaAd(uuid));
+            if (!plain) {
+                qCWarning(KLIPPER_LOG) << "Encrypted history entry failed authentication" << uuid;
+                continue;
+            }
+            if (std::optional<VaultMeta> meta = parseMeta(*plain)) {
+                result.metas.insert(uuid, std::move(*meta));
+            }
+            HistoryVault::wipe(*plain);
+        }
+        return result;
+    }));
+}
+
+void HistoryModel::lockVault()
+{
+    m_autoLockTimer.stop();
+    if (!m_vault.isUnlocked()) {
+        return;
+    }
+    m_vault.lock(); // frees (and zeroes) the secret key
+    for (auto &item : m_items) {
+        if (item->isEncrypted()) {
+            item = HistoryItem::createLocked(item->uuid());
+        }
+    }
+    if (!m_items.empty()) {
+        Q_EMIT dataChanged(index(0), index(m_items.size() - 1), {Qt::DisplayRole, TypeRole, TypeIntRole, ImageSizeRole, EncryptedRole, LockedRole});
+    }
+    Q_EMIT vaultStateChanged();
+}
+
+void HistoryModel::changeVaultPassword(const QString &oldPassword, const QString &newPassword)
+{
+    if (!m_vault.isConfigured() || m_vaultBusy || newPassword.isEmpty()) {
+        Q_EMIT vaultOperationFinished(VaultOperation::ChangePassword, false);
+        return;
+    }
+    setVaultBusy(true);
+    auto watcher = new QFutureWatcher<HistoryVault::Params>(this);
+    connect(watcher, &QFutureWatcherBase::finished, this, [this, watcher] {
+        HistoryVault::Params params = watcher->result();
+        watcher->deleteLater();
+        setVaultBusy(false);
+        const bool ok = !params.wrappedSecretKey.isEmpty() && m_vault.installParams(m_db, std::move(params));
+        if (ok) {
+            // The old wrapped key is still in free pages / the WAL; with it the old password would still open the vault
+            QSqlQuery(u"PRAGMA wal_checkpoint(TRUNCATE)"_s, m_db).exec();
+        }
+        Q_EMIT vaultOperationFinished(VaultOperation::ChangePassword, ok);
+    });
+    // The old password is always verified, even when unlocked, so an unattended unlocked session can't change it
+    watcher->setFuture(QtConcurrent::run([params = m_vault.params(), oldPassword = oldPassword.toUtf8(), newPassword = newPassword.toUtf8()]() mutable {
+        HistoryVault::SecretKey secretKey = HistoryVault::unwrapSecretKey(params, std::move(oldPassword));
+        if (!secretKey) {
+            HistoryVault::wipe(newPassword);
+            return HistoryVault::Params{};
+        }
+        return HistoryVault::rewrap(params, secretKey, std::move(newPassword));
+    }));
+}
+
+void HistoryModel::resetVault()
+{
+    if (!m_vault.isConfigured() || m_vaultBusy) {
+        return;
+    }
+    {
+        TransactionGuard transaction(&m_db);
+        QSqlQuery query(m_db);
+        query.prepare(u"DELETE FROM main WHERE mimetypes=?"_s);
+        query.addBindValue(QString(HistoryItem::encryptedMimeType));
+        if (!transaction.exec(query) || !transaction.exec(u"DELETE FROM vault"_s)) {
+            return;
+        }
+    }
+    m_vault.reset(m_db);
+    m_autoLockTimer.stop();
+    int starredCount = m_starredCount;
+    for (qsizetype i = m_items.size() - 1; i >= 0; --i) {
+        if (m_items[i]->isEncrypted()) {
+            beginRemoveRows(QModelIndex(), i, i);
+            m_items.removeAt(i);
+            endRemoveRows();
+        }
+    }
+    // Starred encrypted rows are gone from the database now, so recount
+    if (QSqlQuery query(u"SELECT COUNT(*) FROM main WHERE starred = 1"_s, m_db); query.next()) {
+        starredCount = query.value(0).toInt();
+    }
+    m_starredCount = starredCount;
+    QSqlQuery(u"VACUUM"_s, m_db).exec();
+    QSqlQuery(u"PRAGMA wal_checkpoint(TRUNCATE)"_s, m_db).exec();
+    Q_EMIT vaultStateChanged();
 }
 
 #include "moc_historymodel.cpp"

@@ -8,6 +8,7 @@ set(libklipper_common_SRCS
     historycycler.cpp historycycler.h
     historyitem.cpp historyitem.h
     historymodel.cpp
+    historyvault.cpp historyvault.h
     klipperpopup.cpp
     actionstreewidget.cpp
     editactiondialog.cpp
@@ -23,6 +24,10 @@ ecm_qt_declare_logging_category(libklipper_common_SRCS HEADER klipper_debug.h ID
 configure_file(config-klipper.h.cmake ${CMAKE_CURRENT_BINARY_DIR}/config-klipper.h )
 
 kconfig_add_kcfg_files(libklipper_common_SRCS klippersettings.kcfgc)
+
+# History encryption (historyvault.cpp)
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(SODIUM REQUIRED IMPORTED_TARGET libsodium>=1.0.18)
 
 add_library(klipper SHARED ${libklipper_common_SRCS})
 generate_export_header(klipper)
@@ -50,6 +55,7 @@ target_link_libraries(klipper
     Wayland::Client
     LayerShellQt::Interface
     ZLIB::ZLIB
+    PkgConfig::SODIUM
 )
 
 if (HAVE_X11)

@@ -13,6 +13,16 @@ target_link_libraries(testHistoryModel
 add_test(NAME klipper-testHistoryModel COMMAND testHistoryModel)
 ecm_mark_as_test(testHistoryModel)
 
+# Test history encryption
+add_executable(testHistoryVault historyvaulttest.cpp)
+target_link_libraries(testHistoryVault
+    Qt::Test
+    Qt::Sql
+    klipper
+)
+add_test(NAME klipper-testHistoryVault COMMAND testHistoryVault)
+ecm_mark_as_test(testHistoryVault)
+
 # Test Utils
 add_executable(testKlipperUtils utilstest.cpp)
 target_link_libraries(testKlipperUtils

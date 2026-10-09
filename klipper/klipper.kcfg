@@ -62,6 +62,20 @@
         <max>2048</max>
 	<tooltip>The clipboard history will store up to this many items.</tooltip>
     </entry>
+    <entry name="PlaintextHistoryItems" type="Int">
+        <label>Unencrypted recent entries:</label>
+        <default>5</default>
+        <min>1</min>
+        <max>100</max>
+        <tooltip>Once a history password is set, only this many of the most recent entries are stored unencrypted. Older entries are encrypted and need the password to be shown.</tooltip>
+    </entry>
+    <entry name="VaultAutoLockMinutes" type="Int">
+        <label>Lock encrypted history after:</label>
+        <default>10</default>
+        <min>0</min>
+        <max>1440</max>
+        <tooltip>Minutes after unlocking until older entries are locked again (0: only when the screen locks).</tooltip>
+    </entry>
     <entry key="ActionListChanged" name="ActionList" type="Int">
         <label>Dummy entry for indicating changes in an action's tree widget</label>
         <default>-1</default>
