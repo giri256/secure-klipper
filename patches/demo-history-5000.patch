@@ -1,0 +1,134 @@
+From 4f0a6ddb4361f3394bf8987b55c345eb34a2e82b Mon Sep 17 00:00:00 2001
+From: giri256 <80974392+giri256@users.noreply.github.com>
+Date: Fri, 9 Oct 2026 17:07:19 +0000
+Subject: [PATCH] DEMO: raise Klipper history cap 2048 -> 5000 (not for final
+ version)
+
+klipper.kcfg MaxClipItems <max> is the only cap: KConfigSkeleton clamps the
+value read from klipperrc and KConfigDialogManager takes the spinbox range
+from it. Adds HistoryModelTest::testHistory5000 proving 5000 rows load,
+evict and persist.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ klipper/autotests/historymodeltest.cpp | 77 ++++++++++++++++++++++++++
+ klipper/klipper.kcfg                   |  2 +-
+ 2 files changed, 78 insertions(+), 1 deletion(-)
+
+diff --git a/klipper/autotests/historymodeltest.cpp b/klipper/autotests/historymodeltest.cpp
+index 98f0d1a..c8b28b6 100644
+--- a/klipper/autotests/historymodeltest.cpp
++++ b/klipper/autotests/historymodeltest.cpp
+@@ -9,6 +9,10 @@
+ #include "systemclipboard.h"
+ 
+ #include <QAbstractItemModelTester>
++#include <QCryptographicHash>
++#include <QDir>
++#include <QElapsedTimer>
++#include <QSqlQuery>
+ #include <QMimeData>
+ #include <QStandardPaths>
+ #include <QTest>
+@@ -29,6 +33,7 @@ private Q_SLOTS:
+     void testType_data();
+     void testType();
+     void testKeepClipboardContents();
++    void testHistory5000();
+ };
+ 
+ void HistoryModelTest::initTestCase()
+@@ -263,5 +268,77 @@ void HistoryModelTest::testKeepClipboardContents()
+     QDir(QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation) + u"/klipper").removeRecursively();
+ }
+ 
++// DEMO (branch demo/history-5000): the MaxClipItems cap in klipper.kcfg is the only thing
++// limiting history length. Writing 5000 to klipperrc must survive KConfigSkeleton's clamping,
++// the model must load 5000 rows from history3.sqlite and evict the oldest on the next copy.
++// The DB is seeded with SQL because each real insert costs ~50 ms of fsync + KIO jobs.
++void HistoryModelTest::testHistory5000()
++{
++    constexpr int target = 5000;
++    std::shared_ptr<HistoryModel> history = HistoryModel::self();
++    history->clear();
++    QTRY_COMPARE(history->pendingJobs(), 0);
++
++    KCoreConfigSkeleton *settings = HistoryModel::settings();
++    settings->config()->group(QStringLiteral("General")).writeEntry("MaxClipItems", target);
++    settings->config()->group(QStringLiteral("General")).writeEntry("KeepClipboardContents", true);
++    settings->load();
++    history->loadSettings();
++    QCOMPARE(history->maxSize(), target); // fails with 2048 on upstream klipper.kcfg
++
++    // Seed target items: "item 0" oldest ... "item 4999" newest
++    QVERIFY(history->m_db.transaction());
++    for (int i = 0; i < target; ++i) {
++        const QString text = QStringLiteral("item %1").arg(i);
++        const QString uuid = QString::fromLatin1(QCryptographicHash::hash(text.toUtf8(), QCryptographicHash::Sha1).toHex());
++        QSqlQuery query(history->m_db);
++        query.prepare(QStringLiteral("INSERT INTO main (uuid, added_time, last_used_time, mimetypes, text, starred) VALUES (?, ?, ?, ?, ?, 0)"));
++        query.addBindValue(uuid);
++        query.addBindValue(1000.0 + i);
++        query.addBindValue(1000.0 + i);
++        query.addBindValue(QStringLiteral("text/plain"));
++        query.addBindValue(text);
++        QVERIFY(query.exec());
++        query.prepare(QStringLiteral("INSERT INTO aux (uuid, mimetype, data_uuid) VALUES (?, 'text/plain', ?)"));
++        query.addBindValue(uuid);
++        query.addBindValue(uuid);
++        QVERIFY(query.exec());
++        HistoryModel::saveToFile(history->m_dbFolder, text.toUtf8(), uuid, uuid);
++    }
++    QVERIFY(history->m_db.commit());
++
++    QElapsedTimer timer;
++    timer.start();
++    QVERIFY(history->loadHistory());
++    qInfo() << "loaded" << history->rowCount() << "items from history3.sqlite in" << timer.elapsed() << "ms";
++    QCOMPARE(history->rowCount(), target);
++    QCOMPARE(history->data(history->index(0, 0)).toString(), QStringLiteral("item 4999"));
++    QCOMPARE(history->data(history->index(target - 1, 0)).toString(), QStringLiteral("item 0"));
++
++    // One more copy: still 5000, "item 0" evicted from model and DB
++    timer.restart();
++    QVERIFY(history->insert(QStringLiteral("item %1").arg(target)));
++    QTRY_COMPARE(history->pendingJobs(), 0);
++    qInfo() << "insert + eviction at 5000 took" << timer.elapsed() << "ms";
++    QCOMPARE(history->rowCount(), target);
++    QCOMPARE(history->data(history->index(0, 0)).toString(), QStringLiteral("item 5000"));
++    QCOMPARE(history->data(history->index(target - 1, 0)).toString(), QStringLiteral("item 1"));
++    QSqlQuery count(QStringLiteral("SELECT COUNT(*) FROM main"), history->m_db);
++    QVERIFY(count.next());
++    QCOMPARE(count.value(0).toInt(), target);
++
++    // Clean up without HistoryModel::clear(): its KIO::del of 5000 data folders takes ~135 s.
++    QSqlQuery(QStringLiteral("DELETE FROM main"), history->m_db).exec();
++    QSqlQuery(QStringLiteral("DELETE FROM aux"), history->m_db).exec();
++    QDir(history->m_dbFolder + QStringLiteral("/data")).removeRecursively();
++    history->beginResetModel();
++    history->m_items.clear();
++    history->endResetModel();
++    settings->config()->group(QStringLiteral("General")).deleteEntry("MaxClipItems");
++    settings->load();
++    history->loadSettings();
++    QCOMPARE(history->rowCount(), 0);
++}
++
+ QTEST_MAIN(HistoryModelTest)
+ #include "historymodeltest.moc"
+diff --git a/klipper/klipper.kcfg b/klipper/klipper.kcfg
+index c78b0fa..78df969 100644
+--- a/klipper/klipper.kcfg
++++ b/klipper/klipper.kcfg
+@@ -59,7 +59,7 @@
+         <label>History size:</label>
+         <default>20</default>
+         <min>1</min>
+-        <max>2048</max>
++        <max>5000</max>
+ 	<tooltip>The clipboard history will store up to this many items.</tooltip>
+     </entry>
+     <entry key="ActionListChanged" name="ActionList" type="Int">
+-- 
+2.55.0
+
