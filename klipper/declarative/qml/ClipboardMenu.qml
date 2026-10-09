@@ -67,6 +67,13 @@ PlasmaComponents3.ScrollView {
     }
     onTriggerAction: uuid => model.invokeAction(uuid)
 
+    Connections {
+        target: clipboardMenu.model
+        function onUnlockRequested(): void {
+            vaultBar.focusPassword();
+        }
+    }
+
     onExpandedChanged: {
         if (expanded) {
             menuListView.forceActiveFocus();
@@ -254,7 +261,7 @@ PlasmaComponents3.ScrollView {
                     Layout.fillWidth: true
                     enabled: menuListView.count > 0 || filter.text.length > 0
                     KeyNavigation.up: clipboardMenu.dialogItem.KeyNavigation.up /* ToolBar */
-                    KeyNavigation.right: clearHistoryButton.visible ? clearHistoryButton : (tabBar.visible ? tabBar : null)
+                    KeyNavigation.right: vaultButton.visible ? vaultButton : (clearHistoryButton.visible ? clearHistoryButton : (tabBar.visible ? tabBar : null))
                     Keys.onDownPressed: event => {
                         if (tabBar.visible) {
                             tabBar.forceActiveFocus();
@@ -275,6 +282,48 @@ PlasmaComponents3.ScrollView {
                     }
                 }
 
+                // Set up the history vault, or lock it when unlocked
+                PlasmaComponents3.ToolButton {
+                    id: vaultButton
+                    readonly property bool canLock: clipboardMenu.model.vaultConfigured && clipboardMenu.model.vaultUnlocked
+                    visible: !clipboardMenu.model.vaultConfigured || canLock
+                    enabled: !clipboardMenu.model.vaultBusy
+                    checkable: !canLock
+                    checked: vaultBar.setupRequested
+                    icon.name: "object-locked"
+                    display: PlasmaComponents3.AbstractButton.IconOnly
+                    text: canLock ? i18nd("klipper", "Lock Older Entries") : i18nd("klipper", "Encrypt Older Entries…")
+                    KeyNavigation.left: filter
+                    KeyNavigation.right: changePasswordButton.visible ? changePasswordButton : clearHistoryButton
+                    onClicked: {
+                        if (canLock) {
+                            clipboardMenu.model.lockVault();
+                        } else {
+                            vaultBar.setupRequested = checked;
+                        }
+                    }
+                    PlasmaComponents3.ToolTip {
+                        text: vaultButton.text
+                    }
+                }
+
+                PlasmaComponents3.ToolButton {
+                    id: changePasswordButton
+                    visible: vaultButton.canLock
+                    enabled: !clipboardMenu.model.vaultBusy
+                    checkable: true
+                    checked: vaultBar.changeRequested
+                    icon.name: "dialog-password"
+                    display: PlasmaComponents3.AbstractButton.IconOnly
+                    text: i18nd("klipper", "Change History Password…")
+                    KeyNavigation.left: vaultButton
+                    KeyNavigation.right: clearHistoryButton
+                    onClicked: vaultBar.changeRequested = checked
+                    PlasmaComponents3.ToolTip {
+                        text: changePasswordButton.text
+                    }
+                }
+
                 PlasmaComponents3.ToolButton {
                     id: clearHistoryButton
                     visible: clipboardMenu.showsClearHistoryButton
@@ -284,7 +333,7 @@ PlasmaComponents3.ScrollView {
                     display: PlasmaComponents3.AbstractButton.IconOnly
                     text: i18nd("klipper", "Clear History")
 
-                    KeyNavigation.left: filter
+                    KeyNavigation.left: changePasswordButton.visible ? changePasswordButton : (vaultButton.visible ? vaultButton : filter)
                     KeyNavigation.down: tabBar.visible ? tabBar : menuListView
 
                     onClicked: clipboardMenu.clearHistory()
@@ -293,6 +342,14 @@ PlasmaComponents3.ScrollView {
                         text: clearHistoryButton.text
                     }
                 }
+            }
+
+            VaultBar {
+                id: vaultBar
+                Layout.fillWidth: true
+                Layout.topMargin: visible ? Kirigami.Units.smallSpacing : 0
+                Layout.bottomMargin: visible ? Kirigami.Units.smallSpacing : 0
+                model: clipboardMenu.model
             }
 
             PlasmaComponents3.TabBar {
@@ -448,7 +505,9 @@ PlasmaComponents3.ScrollView {
                 width: parent.width
                 readonly property bool hasText: filter.text.length > 0
                 iconName: hasText ? "edit-none" : "edit-paste"
-                text: hasText ? i18nd("klipper", "No matches") : i18nd("klipper", "Clipboard is empty")
+                text: hasText ? i18nd("klipper", "No matches")
+                    : clipboardMenu.model.lockedCount > 0 ? i18nd("klipper", "Unlock to see older entries")
+                    : i18nd("klipper", "Clipboard is empty")
             }
         }
     }

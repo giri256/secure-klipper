@@ -46,7 +46,8 @@ GridLayout {
             role: DelegateToolButtons.ButtonRole.Edit,
             icon: "document-edit",
             text: i18nd("klipper", "Edit contents"),
-            visible: menuItem.type === toolButtonsLayout.textItemType
+            // Encrypted entries are read-only; editing would need a new plaintext copy anyway
+            visible: menuItem.type === toolButtonsLayout.textItemType && !(menuItem.model?.encrypted ?? false)
         },
         {
             role: DelegateToolButtons.ButtonRole.Remove,

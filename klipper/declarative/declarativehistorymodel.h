@@ -27,6 +27,13 @@ class DeclarativeHistoryModel : public QSortFilterProxyModel
 
     Q_PROPERTY(bool starredOnly READ starredOnly WRITE setStarredOnly NOTIFY starredOnlyChanged)
 
+    // History vault (entries older than the newest plaintextItems are encrypted)
+    Q_PROPERTY(bool vaultConfigured READ vaultConfigured NOTIFY vaultStateChanged)
+    Q_PROPERTY(bool vaultUnlocked READ vaultUnlocked NOTIFY vaultStateChanged)
+    Q_PROPERTY(bool vaultBusy READ vaultBusy NOTIFY vaultStateChanged)
+    Q_PROPERTY(int lockedCount READ lockedCount NOTIFY vaultStateChanged)
+    Q_PROPERTY(int plaintextItems READ plaintextItems NOTIFY vaultStateChanged)
+
 public:
     explicit DeclarativeHistoryModel(QObject *parent = nullptr);
     ~DeclarativeHistoryModel() override;
@@ -45,12 +52,28 @@ public:
 
     Q_INVOKABLE void invokeAction(const QString &uuid);
 
+    bool vaultConfigured() const;
+    bool vaultUnlocked() const;
+    bool vaultBusy() const;
+    int lockedCount() const;
+    int plaintextItems() const;
+    Q_INVOKABLE void setupVault(const QString &password);
+    Q_INVOKABLE void unlockVault(const QString &password);
+    Q_INVOKABLE void lockVault();
+    Q_INVOKABLE void changeVaultPassword(const QString &oldPassword, const QString &newPassword);
+    Q_INVOKABLE void resetVault();
+
 Q_SIGNALS:
     void countChanged();
     void sourceCountChanged();
     void starredCountChanged();
     void currentTextChanged();
     void starredOnlyChanged();
+    void vaultStateChanged();
+    /// @p operation: 0 setup, 1 unlock, 2 change password (HistoryModel::VaultOperation)
+    void vaultOperationFinished(int operation, bool success);
+    /// A locked entry was activated (e.g. via the history cycler): the popup should ask for the password
+    void unlockRequested();
 
 protected:
     bool filterAcceptsRow(int sourceRow, const QModelIndex &sourceParent) const override;

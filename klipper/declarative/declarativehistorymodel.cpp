@@ -32,6 +32,16 @@ DeclarativeHistoryModel::DeclarativeHistoryModel(QObject *parent)
     });
 
     connect(m_model.get(), &HistoryModel::changed, this, &DeclarativeHistoryModel::currentTextChanged);
+
+    connect(m_model.get(), &HistoryModel::vaultStateChanged, this, [this] {
+        // Locked rows are hidden; lock/unlock flips that for many rows at once
+        invalidateRowsFilter();
+        Q_EMIT vaultStateChanged();
+    });
+    connect(m_model.get(), &HistoryModel::vaultOperationFinished, this, [this](HistoryModel::VaultOperation operation, bool success) {
+        Q_EMIT vaultOperationFinished(static_cast<int>(operation), success);
+    });
+    connect(m_model.get(), &HistoryModel::unlockRequested, this, &DeclarativeHistoryModel::unlockRequested);
 }
 
 DeclarativeHistoryModel::~DeclarativeHistoryModel() = default;
@@ -88,10 +98,64 @@ void DeclarativeHistoryModel::invokeAction(const QString &uuid)
     }
 }
 
+bool DeclarativeHistoryModel::vaultConfigured() const
+{
+    return m_model->isVaultConfigured();
+}
+
+bool DeclarativeHistoryModel::vaultUnlocked() const
+{
+    return m_model->isVaultUnlocked();
+}
+
+bool DeclarativeHistoryModel::vaultBusy() const
+{
+    return m_model->isVaultBusy();
+}
+
+int DeclarativeHistoryModel::lockedCount() const
+{
+    return m_model->lockedCount();
+}
+
+int DeclarativeHistoryModel::plaintextItems() const
+{
+    return int(m_model->plaintextItems());
+}
+
+void DeclarativeHistoryModel::setupVault(const QString &password)
+{
+    m_model->setupVault(password);
+}
+
+void DeclarativeHistoryModel::unlockVault(const QString &password)
+{
+    m_model->unlockVault(password);
+}
+
+void DeclarativeHistoryModel::lockVault()
+{
+    m_model->lockVault();
+}
+
+void DeclarativeHistoryModel::changeVaultPassword(const QString &oldPassword, const QString &newPassword)
+{
+    m_model->changeVaultPassword(oldPassword, newPassword);
+}
+
+void DeclarativeHistoryModel::resetVault()
+{
+    m_model->resetVault();
+}
+
 bool DeclarativeHistoryModel::filterAcceptsRow(int sourceRow, const QModelIndex &sourceParent) const
 {
+    const QModelIndex index = m_model->index(sourceRow, 0, sourceParent);
+    if (index.data(HistoryModel::LockedRole).toBool()) {
+        return false; // content unknown until the vault is unlocked; the vault bar shows how many
+    }
     if (m_starredOnly) {
-        return m_model->index(sourceRow, 0, sourceParent).data(HistoryModel::StarredRole).toBool();
+        return index.data(HistoryModel::StarredRole).toBool();
     }
 
     return true;
