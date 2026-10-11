@@ -121,7 +121,7 @@ scripts/uninstall.sh --purge    # also deletes ~/.local/share/klipper-vault
 
 ### Running next to stock Klipper
 
-The two never share anything. Every name that would otherwise collide inside the one plasmashell process is renamed at build time: the QML module, the SQLite connection, the data folder, the config file, the D-Bus name, the shortcut actions and the image provider. `tests/coexist/run.sh` loads both into one process and checks that each keeps its own database.
+The two never share anything. Every name that would otherwise collide inside the one plasmashell process is renamed at build time: the QML module, the SQLite connection, the data folder, the config file, the D-Bus name, the shortcut actions, the image provider and the C++ class names Qt registers process-wide (without that, the second-loaded clipboard's Edit page would not open). `tests/coexist/run.sh` loads both into one process and checks that each keeps its own database.
 
 | | Stock Klipper | Secure Klipper |
 |---|---|---|

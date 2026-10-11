@@ -35,6 +35,13 @@ sed -i 's/QStringLiteral("repeat_action")/QStringLiteral("vault-repeat_action")/
 # KConfigDialog::showDialog() finds dialogs by name process-wide; window-state groups are cosmetic but kept apart too
 sed -i 's/QStringLiteral("preferences")/QStringLiteral("vault-preferences")/' configdialog.cpp klipper.cpp
 sed -i 's/group(u"klipper"_s)/group(u"klipper-vault"_s)/g' configdialog.cpp editactiondialog.cpp editcommanddialog.cpp
+# Qt's metatype registry is process-wide and keyed by C++ class name: with the stock plugin loaded first,
+# QML resolves "DeclarativeHistoryModel*" to the stock type and the stock EditPage push fails
+# ("Cannot assign QObject* to DeclarativeHistoryModel*"). Rename the QML-facing classes (and HistoryModel,
+# whose Q_ENUMs are also registered by name); the QML type names stay HistoryModel / KlipperInterface.
+grep -rlZw --include='*.cpp' --include='*.h' 'HistoryModel\|DeclarativeHistoryModel\|KlipperInterface' . \
+  | xargs -0 sed -i -E 's/\b(Declarative)?HistoryModel\b/Vault\1HistoryModel/g; s/\bKlipperInterface\b/VaultKlipperInterface/g; s/QML_NAMED_ELEMENT\(VaultHistoryModel\)/QML_NAMED_ELEMENT(HistoryModel)/'
+sed -i -E 's/^(\s*)QML_ELEMENT$/\1QML_NAMED_ELEMENT(KlipperInterface)/' declarative/klipperinterface.h
 sed -i 's/<kcfgfile name="klipperrc"\/>/<kcfgfile name="klippervaultrc"\/>/' klipper.kcfg
 # Two clipboard managers both "preventing an empty clipboard" would keep re-setting it at each other
 python3 - klipper.kcfg <<'EOF'
@@ -50,6 +57,7 @@ sed -i '/org.kde.klipper.desktop/d; /^add_subdirectory(kconf_update)/d' CMakeLis
 
 # Fail loudly if any shared name survived
 leftover=$(grep -rn 'u"klipper"_s\|u"/klipper"\|QStringLiteral("org\.kde\.klipper")\|showDialog(QStringLiteral("preferences")\|"/klipper"\|klipperrc"\|private\.clipboard[^v]\|private\.clipboard$\|"klipperpreview\|//klipperpreview\|add_library(klipper SHARED' . || true)
+leftover+=$(grep -rnwE --include='*.h' 'class (Declarative)?HistoryModel|class KlipperInterface' . || true)
 if [ -n "$leftover" ]; then echo "Unrenamed shared names:"; echo "$leftover"; exit 1; fi
 
 # Applet: plain QML package (no compiled applet class needed)
