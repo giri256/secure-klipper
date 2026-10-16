@@ -2871,3 +2871,345 @@ index a2f8064..291ef61 100644
 -- 
 2.55.0
 
+From 9a0d5e9bf2a81c4a9f1c6cc94a13c6acf7e83581 Mon Sep 17 00:00:00 2001
+From: giri256 <80974392+giri256@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 16:47:04 +0000
+Subject: [PATCH] Restore previews for unlocked encrypted images
+
+---
+ klipper/autotests/historyvaulttest.cpp        | 15 ++++
+ klipper/declarative/CMakeLists.txt            |  2 +
+ klipper/declarative/klipperplugin.cpp         |  3 +
+ .../declarative/vaultpreviewimageprovider.cpp | 70 ++++++++++++++++
+ .../declarative/vaultpreviewimageprovider.h   | 22 +++++
+ klipper/historymodel.cpp                      | 81 +++++++++++++++++--
+ klipper/historymodel.h                        |  3 +
+ 7 files changed, 191 insertions(+), 5 deletions(-)
+ create mode 100644 klipper/declarative/vaultpreviewimageprovider.cpp
+ create mode 100644 klipper/declarative/vaultpreviewimageprovider.h
+
+diff --git a/klipper/autotests/historyvaulttest.cpp b/klipper/autotests/historyvaulttest.cpp
+index 5ba3f99..d69f15f 100644
+--- a/klipper/autotests/historyvaulttest.cpp
++++ b/klipper/autotests/historyvaulttest.cpp
+@@ -198,6 +198,13 @@ void HistoryVaultTest::testModelVault()
+     QCOMPARE(text(history.get(), 5), u"secret-item-05"_s);
+     QCOMPARE(text(history.get(), 11), u"▨ 10x7"_s);
+     QCOMPARE(history->index(11).data(HistoryModel::ImageSizeRole).toSize(), QSize(10, 7));
++    QCOMPARE(history->index(11).data(HistoryModel::TypeIntRole).toInt(), int(HistoryItemType::Image));
++    const QString encryptedImageUuid = history->index(11).data(HistoryModel::UuidRole).toString();
++    QCOMPARE(history->index(11).data(HistoryModel::ImageUrlRole).toUrl().scheme(), u"image"_s);
++    QByteArray encryptedImagePreview = history->vaultImagePreviewData(encryptedImageUuid);
++    QVERIFY(!encryptedImagePreview.isEmpty());
++    QCOMPARE(QImage::fromData(encryptedImagePreview).size(), QSize(10, 7));
++    HistoryVault::wipe(encryptedImagePreview);
+ 
+     // --- on disk: no plaintext of encrypted entries anywhere (db, WAL, data/)
+     {
+@@ -227,6 +234,8 @@ void HistoryVaultTest::testModelVault()
+     history->lockVault();
+     QVERIFY(!history->isVaultUnlocked());
+     QCOMPARE(history->lockedCount(), 7);
++    QCOMPARE(history->index(11).data(HistoryModel::TypeIntRole).toInt(), int(HistoryItemType::Text));
++    QVERIFY(history->index(11).data(HistoryModel::ImageUrlRole).toUrl().isEmpty());
+     QVERIFY(history->index(8).data(HistoryModel::LockedRole).toBool());
+     QCOMPARE(text(history.get(), 8), QString());
+     {
+@@ -269,6 +278,12 @@ void HistoryVaultTest::testModelVault()
+     QCOMPARE(history->lockedCount(), 0);
+     QCOMPARE(text(history.get(), 0), u"secret-item-01"_s);
+     QCOMPARE(text(history.get(), 12), u"▨ 10x7"_s);
++    QCOMPARE(history->index(12).data(HistoryModel::TypeIntRole).toInt(), int(HistoryItemType::Image));
++    QCOMPARE(history->index(12).data(HistoryModel::ImageUrlRole).toUrl().scheme(), u"image"_s);
++    QByteArray unlockedImagePreview = history->vaultImagePreviewData(history->index(12).data(HistoryModel::UuidRole).toString());
++    QVERIFY(!unlockedImagePreview.isEmpty());
++    QCOMPARE(QImage::fromData(unlockedImagePreview).size(), QSize(10, 7));
++    HistoryVault::wipe(unlockedImagePreview);
+ 
+     // --- using an encrypted entry decrypts it back into a normal one
+     const QString imageUuid = history->index(12).data(HistoryModel::UuidRole).toString();
+diff --git a/klipper/declarative/CMakeLists.txt b/klipper/declarative/CMakeLists.txt
+index 7d771a7..cffaab9 100644
+--- a/klipper/declarative/CMakeLists.txt
++++ b/klipper/declarative/CMakeLists.txt
+@@ -23,12 +23,14 @@ target_sources(klipperplugin
+     PRIVATE
+         klipperplugin.cpp
+         previewimageprovider.cpp previewimageprovider.h
++        vaultpreviewimageprovider.cpp vaultpreviewimageprovider.h
+         declarativehistorymodel.cpp declarativehistorymodel.h
+         klipperinterface.cpp klipperinterface.h
+ )
+ target_link_libraries(klipperplugin
+     PRIVATE
+         Qt::Qml
++        Qt::Concurrent
+         klipper
+ )
+ 
+diff --git a/klipper/declarative/klipperplugin.cpp b/klipper/declarative/klipperplugin.cpp
+index c3529ba..c7adf3c 100644
+--- a/klipper/declarative/klipperplugin.cpp
++++ b/klipper/declarative/klipperplugin.cpp
+@@ -9,6 +9,8 @@
+ #include <QQmlExtensionPlugin>
+ 
+ #include "previewimageprovider.h"
++#include "vaultpreviewimageprovider.h"
++#include "../historymodel.h"
+ 
+ void qml_register_types_org_kde_plasma_private_clipboard();
+ 
+@@ -28,6 +30,7 @@ public:
+     void initializeEngine(QQmlEngine *engine, const char * /*uri*/) override
+     {
+         engine->addImageProvider(QStringLiteral("klipperpreview"), new PreviewImageProvider);
++        engine->addImageProvider(QStringLiteral("klippervaultpreview"), new VaultPreviewImageProvider(HistoryModel::self()));
+     }
+ };
+ 
+diff --git a/klipper/declarative/vaultpreviewimageprovider.cpp b/klipper/declarative/vaultpreviewimageprovider.cpp
+new file mode 100644
+index 0000000..81d1486
+--- /dev/null
++++ b/klipper/declarative/vaultpreviewimageprovider.cpp
+@@ -0,0 +1,70 @@
++/*
++    SPDX-FileCopyrightText: 2026 giri256
++
++    SPDX-License-Identifier: GPL-2.0-or-later
++*/
++#include "vaultpreviewimageprovider.h"
++
++#include <QFutureWatcher>
++#include <QImage>
++#include <QQuickTextureFactory>
++#include <QtConcurrentRun>
++
++#include "../historymodel.h"
++#include "../historyvault.h"
++
++class VaultPreviewImageResponse final : public QQuickImageResponse
++{
++    Q_OBJECT
++
++public:
++    VaultPreviewImageResponse(std::shared_ptr<HistoryModel> model, QString uuid, QSize requestedSize)
++        : m_watcher(new QFutureWatcher<QImage>(this))
++    {
++        connect(m_watcher, &QFutureWatcher<QImage>::finished, this, [this] {
++            m_image = m_watcher->result();
++            m_watcher->deleteLater();
++            Q_EMIT finished();
++        });
++        m_watcher->setFuture(QtConcurrent::run([model = std::move(model), uuid = std::move(uuid), requestedSize] {
++            QByteArray encoded = model->vaultImagePreviewData(uuid);
++            QImage image = QImage::fromData(encoded);
++            HistoryVault::wipe(encoded);
++            if (!image.isNull()) {
++                if (requestedSize.width() > 0 && requestedSize.height() > 0) {
++                    image = image.scaled(requestedSize, Qt::KeepAspectRatio, Qt::SmoothTransformation);
++                } else if (requestedSize.height() > 0) {
++                    image = image.scaledToHeight(requestedSize.height(), Qt::SmoothTransformation);
++                } else if (requestedSize.width() > 0) {
++                    image = image.scaledToWidth(requestedSize.width(), Qt::SmoothTransformation);
++                }
++            }
++            return image;
++        }));
++    }
++
++    QQuickTextureFactory *textureFactory() const override
++    {
++        return QQuickTextureFactory::textureFactoryForImage(m_image);
++    }
++
++private:
++    QFutureWatcher<QImage> *m_watcher;
++    QImage m_image;
++};
++
++VaultPreviewImageProvider::VaultPreviewImageProvider(std::shared_ptr<HistoryModel> model)
++    : m_model(std::move(model))
++{
++}
++
++QQuickImageResponse *VaultPreviewImageProvider::requestImageResponse(const QString &id, const QSize &requestedSize)
++{
++    QString uuid = id;
++    while (uuid.startsWith(u'/')) {
++        uuid.remove(0, 1);
++    }
++    return new VaultPreviewImageResponse(m_model, std::move(uuid), requestedSize);
++}
++
++#include "vaultpreviewimageprovider.moc"
+diff --git a/klipper/declarative/vaultpreviewimageprovider.h b/klipper/declarative/vaultpreviewimageprovider.h
+new file mode 100644
+index 0000000..3d2dec9
+--- /dev/null
++++ b/klipper/declarative/vaultpreviewimageprovider.h
+@@ -0,0 +1,22 @@
++/*
++    SPDX-FileCopyrightText: 2026 giri256
++
++    SPDX-License-Identifier: GPL-2.0-or-later
++*/
++#pragma once
++
++#include <memory>
++
++#include <QQuickAsyncImageProvider>
++
++class HistoryModel;
++
++class VaultPreviewImageProvider final : public QQuickAsyncImageProvider
++{
++public:
++    explicit VaultPreviewImageProvider(std::shared_ptr<HistoryModel> model);
++    QQuickImageResponse *requestImageResponse(const QString &id, const QSize &requestedSize) override;
++
++private:
++    std::shared_ptr<HistoryModel> m_model;
++};
+diff --git a/klipper/historymodel.cpp b/klipper/historymodel.cpp
+index 291ef61..992c5a5 100644
+--- a/klipper/historymodel.cpp
++++ b/klipper/historymodel.cpp
+@@ -26,6 +26,7 @@
+ #include <QSqlError>
+ #include <QSqlQuery>
+ #include <QStandardPaths>
++#include <QThread>
+ #include <QtConcurrentRun>
+ 
+ #include <KIO/DeleteJob>
+@@ -456,13 +457,18 @@ QVariant HistoryModel::data(const QModelIndex &index, int role) const
+             }
+             return item->text();
+         case ImageUrlRole:
+-            return QUrl(); // never written to disk in plaintext
++            if (!item->isLocked() && item->imageSize().isValid() && item->text().isEmpty()) {
++                // The QML image provider decrypts the preview into memory only. Do not
++                // materialize an older image as a plaintext file on persistent storage.
++                return QUrl(u"image://klippervaultpreview/"_s + item->uuid());
++            }
++            return QUrl();
+         case ImageSizeRole:
+             return item->imageSize();
+         case TypeRole:
+-            return QVariant::fromValue<HistoryItemType>(HistoryItemType::Text);
++            return QVariant::fromValue<HistoryItemType>(item->imageSize().isValid() && item->text().isEmpty() ? HistoryItemType::Image : HistoryItemType::Text);
+         case TypeIntRole:
+-            return int(HistoryItemType::Text);
++            return int(item->imageSize().isValid() && item->text().isEmpty() ? HistoryItemType::Image : HistoryItemType::Text);
+         default:
+             break;
+         }
+@@ -1216,6 +1222,71 @@ int HistoryModel::lockedCount() const
+     });
+ }
+ 
++QByteArray HistoryModel::vaultImagePreviewData(const QString &uuid) const
++{
++    // Image providers can run on a loader thread. Snapshot the DB row and key on the
++    // model's owning thread, then perform the potentially large decryption off-thread.
++    QByteArray sealedPayload;
++    HistoryVault::SecretKey secretKey;
++    QByteArray publicKey;
++    auto snapshot = [this, &uuid, &sealedPayload, &secretKey, &publicKey] {
++        if (!m_vault.isUnlocked() || !m_db.isOpen()) {
++            return;
++        }
++        QSqlQuery query(m_db);
++        query.prepare(u"SELECT payload FROM vault WHERE uuid=?"_s);
++        query.addBindValue(uuid);
++        if (!query.exec() || !query.next()) {
++            return;
++        }
++        sealedPayload = query.value(0).toByteArray();
++        secretKey = m_vault.secretKey();
++        publicKey = m_vault.params().publicKey;
++    };
++
++    if (QThread::currentThread() == thread()) {
++        snapshot();
++    } else if (!QMetaObject::invokeMethod(const_cast<HistoryModel *>(this), snapshot, Qt::BlockingQueuedConnection)) {
++        return {};
++    }
++    if (sealedPayload.isEmpty() || !secretKey || publicKey.isEmpty()) {
++        return {};
++    }
++
++    std::optional<QByteArray> payload = HistoryVault::open(secretKey, publicKey, sealedPayload, payloadAd(uuid));
++    if (!payload) {
++        return {};
++    }
++    quint8 format = 0;
++    AuxRows auxRows;
++    Blobs blobs;
++    {
++        QDataStream in(*payload);
++        in.setVersion(QDataStream::Qt_6_5);
++        in >> format >> auxRows >> blobs;
++        if (format != s_vaultFormat || in.status() != QDataStream::Ok) {
++            HistoryVault::wipe(*payload);
++            for (auto it = blobs.begin(); it != blobs.end(); ++it) {
++                HistoryVault::wipe(it.value());
++            }
++            return {};
++        }
++    }
++    HistoryVault::wipe(*payload);
++
++    QByteArray imageData;
++    for (const auto &[mimeType, dataUuid] : std::as_const(auxRows)) {
++        if (mimeType == s_imageFormat) {
++            imageData = blobs.value(dataUuid);
++            break;
++        }
++    }
++    for (auto it = blobs.begin(); it != blobs.end(); ++it) {
++        HistoryVault::wipe(it.value());
++    }
++    return imageData;
++}
++
+ qsizetype HistoryModel::plaintextItems() const
+ {
+     return m_plaintextItems;
+@@ -1538,7 +1609,7 @@ void HistoryModel::unlockVault(const QString &password)
+             }
+         }
+         if (!m_items.empty()) {
+-            Q_EMIT dataChanged(index(0), index(m_items.size() - 1), {Qt::DisplayRole, TypeRole, TypeIntRole, ImageSizeRole, EncryptedRole, LockedRole});
++            Q_EMIT dataChanged(index(0), index(m_items.size() - 1), {Qt::DisplayRole, TypeRole, TypeIntRole, ImageUrlRole, ImageSizeRole, EncryptedRole, LockedRole});
+         }
+         restartAutoLock();
+         Q_EMIT vaultStateChanged();
+@@ -1580,7 +1651,7 @@ void HistoryModel::lockVault()
+         }
+     }
+     if (!m_items.empty()) {
+-        Q_EMIT dataChanged(index(0), index(m_items.size() - 1), {Qt::DisplayRole, TypeRole, TypeIntRole, ImageSizeRole, EncryptedRole, LockedRole});
++        Q_EMIT dataChanged(index(0), index(m_items.size() - 1), {Qt::DisplayRole, TypeRole, TypeIntRole, ImageUrlRole, ImageSizeRole, EncryptedRole, LockedRole});
+     }
+     Q_EMIT vaultStateChanged();
+ }
+diff --git a/klipper/historymodel.h b/klipper/historymodel.h
+index 2e252c8..27aade4 100644
+--- a/klipper/historymodel.h
++++ b/klipper/historymodel.h
+@@ -118,6 +118,9 @@ public:
+     bool isVaultBusy() const;
+     /// Number of encrypted entries whose content is unavailable because the vault is locked.
+     int lockedCount() const;
++    /// Returns a decrypted image payload for the QML preview provider. Safe to call from
++    /// an image-loading worker; SQLite access is marshalled back to the model thread.
++    QByteArray vaultImagePreviewData(const QString &uuid) const;
+     qsizetype plaintextItems() const;
+     /// Asynchronous; emits vaultOperationFinished(Setup, ok).
+     void setupVault(const QString &password);
+-- 
+2.55.0
+

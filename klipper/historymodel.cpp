@@ -26,6 +26,7 @@
 #include <QSqlError>
 #include <QSqlQuery>
 #include <QStandardPaths>
+#include <QThread>
 #include <QtConcurrentRun>
 
 #include <KIO/DeleteJob>
@@ -456,13 +457,18 @@ QVariant HistoryModel::data(const QModelIndex &index, int role) const
             }
             return item->text();
         case ImageUrlRole:
-            return QUrl(); // never written to disk in plaintext
+            if (!item->isLocked() && item->imageSize().isValid() && item->text().isEmpty()) {
+                // The QML image provider decrypts the preview into memory only. Do not
+                // materialize an older image as a plaintext file on persistent storage.
+                return QUrl(u"image://klippervaultpreview/"_s + item->uuid());
+            }
+            return QUrl();
         case ImageSizeRole:
             return item->imageSize();
         case TypeRole:
-            return QVariant::fromValue<HistoryItemType>(HistoryItemType::Text);
+            return QVariant::fromValue<HistoryItemType>(item->imageSize().isValid() && item->text().isEmpty() ? HistoryItemType::Image : HistoryItemType::Text);
         case TypeIntRole:
-            return int(HistoryItemType::Text);
+            return int(item->imageSize().isValid() && item->text().isEmpty() ? HistoryItemType::Image : HistoryItemType::Text);
         default:
             break;
         }
@@ -1216,6 +1222,71 @@ int HistoryModel::lockedCount() const
     });
 }
 
+QByteArray HistoryModel::vaultImagePreviewData(const QString &uuid) const
+{
+    // Image providers can run on a loader thread. Snapshot the DB row and key on the
+    // model's owning thread, then perform the potentially large decryption off-thread.
+    QByteArray sealedPayload;
+    HistoryVault::SecretKey secretKey;
+    QByteArray publicKey;
+    auto snapshot = [this, &uuid, &sealedPayload, &secretKey, &publicKey] {
+        if (!m_vault.isUnlocked() || !m_db.isOpen()) {
+            return;
+        }
+        QSqlQuery query(m_db);
+        query.prepare(u"SELECT payload FROM vault WHERE uuid=?"_s);
+        query.addBindValue(uuid);
+        if (!query.exec() || !query.next()) {
+            return;
+        }
+        sealedPayload = query.value(0).toByteArray();
+        secretKey = m_vault.secretKey();
+        publicKey = m_vault.params().publicKey;
+    };
+
+    if (QThread::currentThread() == thread()) {
+        snapshot();
+    } else if (!QMetaObject::invokeMethod(const_cast<HistoryModel *>(this), snapshot, Qt::BlockingQueuedConnection)) {
+        return {};
+    }
+    if (sealedPayload.isEmpty() || !secretKey || publicKey.isEmpty()) {
+        return {};
+    }
+
+    std::optional<QByteArray> payload = HistoryVault::open(secretKey, publicKey, sealedPayload, payloadAd(uuid));
+    if (!payload) {
+        return {};
+    }
+    quint8 format = 0;
+    AuxRows auxRows;
+    Blobs blobs;
+    {
+        QDataStream in(*payload);
+        in.setVersion(QDataStream::Qt_6_5);
+        in >> format >> auxRows >> blobs;
+        if (format != s_vaultFormat || in.status() != QDataStream::Ok) {
+            HistoryVault::wipe(*payload);
+            for (auto it = blobs.begin(); it != blobs.end(); ++it) {
+                HistoryVault::wipe(it.value());
+            }
+            return {};
+        }
+    }
+    HistoryVault::wipe(*payload);
+
+    QByteArray imageData;
+    for (const auto &[mimeType, dataUuid] : std::as_const(auxRows)) {
+        if (mimeType == s_imageFormat) {
+            imageData = blobs.value(dataUuid);
+            break;
+        }
+    }
+    for (auto it = blobs.begin(); it != blobs.end(); ++it) {
+        HistoryVault::wipe(it.value());
+    }
+    return imageData;
+}
+
 qsizetype HistoryModel::plaintextItems() const
 {
     return m_plaintextItems;
@@ -1538,7 +1609,7 @@ void HistoryModel::unlockVault(const QString &password)
             }
         }
         if (!m_items.empty()) {
-            Q_EMIT dataChanged(index(0), index(m_items.size() - 1), {Qt::DisplayRole, TypeRole, TypeIntRole, ImageSizeRole, EncryptedRole, LockedRole});
+            Q_EMIT dataChanged(index(0), index(m_items.size() - 1), {Qt::DisplayRole, TypeRole, TypeIntRole, ImageUrlRole, ImageSizeRole, EncryptedRole, LockedRole});
         }
         restartAutoLock();
         Q_EMIT vaultStateChanged();
@@ -1580,7 +1651,7 @@ void HistoryModel::lockVault()
         }
     }
     if (!m_items.empty()) {
-        Q_EMIT dataChanged(index(0), index(m_items.size() - 1), {Qt::DisplayRole, TypeRole, TypeIntRole, ImageSizeRole, EncryptedRole, LockedRole});
+        Q_EMIT dataChanged(index(0), index(m_items.size() - 1), {Qt::DisplayRole, TypeRole, TypeIntRole, ImageUrlRole, ImageSizeRole, EncryptedRole, LockedRole});
     }
     Q_EMIT vaultStateChanged();
 }

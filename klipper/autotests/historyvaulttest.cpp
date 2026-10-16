@@ -198,6 +198,13 @@ void HistoryVaultTest::testModelVault()
     QCOMPARE(text(history.get(), 5), u"secret-item-05"_s);
     QCOMPARE(text(history.get(), 11), u"▨ 10x7"_s);
     QCOMPARE(history->index(11).data(HistoryModel::ImageSizeRole).toSize(), QSize(10, 7));
+    QCOMPARE(history->index(11).data(HistoryModel::TypeIntRole).toInt(), int(HistoryItemType::Image));
+    const QString encryptedImageUuid = history->index(11).data(HistoryModel::UuidRole).toString();
+    QCOMPARE(history->index(11).data(HistoryModel::ImageUrlRole).toUrl().scheme(), u"image"_s);
+    QByteArray encryptedImagePreview = history->vaultImagePreviewData(encryptedImageUuid);
+    QVERIFY(!encryptedImagePreview.isEmpty());
+    QCOMPARE(QImage::fromData(encryptedImagePreview).size(), QSize(10, 7));
+    HistoryVault::wipe(encryptedImagePreview);
 
     // --- on disk: no plaintext of encrypted entries anywhere (db, WAL, data/)
     {
@@ -227,6 +234,8 @@ void HistoryVaultTest::testModelVault()
     history->lockVault();
     QVERIFY(!history->isVaultUnlocked());
     QCOMPARE(history->lockedCount(), 7);
+    QCOMPARE(history->index(11).data(HistoryModel::TypeIntRole).toInt(), int(HistoryItemType::Text));
+    QVERIFY(history->index(11).data(HistoryModel::ImageUrlRole).toUrl().isEmpty());
     QVERIFY(history->index(8).data(HistoryModel::LockedRole).toBool());
     QCOMPARE(text(history.get(), 8), QString());
     {
@@ -269,6 +278,12 @@ void HistoryVaultTest::testModelVault()
     QCOMPARE(history->lockedCount(), 0);
     QCOMPARE(text(history.get(), 0), u"secret-item-01"_s);
     QCOMPARE(text(history.get(), 12), u"▨ 10x7"_s);
+    QCOMPARE(history->index(12).data(HistoryModel::TypeIntRole).toInt(), int(HistoryItemType::Image));
+    QCOMPARE(history->index(12).data(HistoryModel::ImageUrlRole).toUrl().scheme(), u"image"_s);
+    QByteArray unlockedImagePreview = history->vaultImagePreviewData(history->index(12).data(HistoryModel::UuidRole).toString());
+    QVERIFY(!unlockedImagePreview.isEmpty());
+    QCOMPARE(QImage::fromData(unlockedImagePreview).size(), QSize(10, 7));
+    HistoryVault::wipe(unlockedImagePreview);
 
     // --- using an encrypted entry decrypts it back into a normal one
     const QString imageUuid = history->index(12).data(HistoryModel::UuidRole).toString();

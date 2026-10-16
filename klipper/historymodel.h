@@ -118,6 +118,9 @@ public:
     bool isVaultBusy() const;
     /// Number of encrypted entries whose content is unavailable because the vault is locked.
     int lockedCount() const;
+    /// Returns a decrypted image payload for the QML preview provider. Safe to call from
+    /// an image-loading worker; SQLite access is marshalled back to the model thread.
+    QByteArray vaultImagePreviewData(const QString &uuid) const;
     qsizetype plaintextItems() const;
     /// Asynchronous; emits vaultOperationFinished(Setup, ok).
     void setupVault(const QString &password);

@@ -9,6 +9,8 @@
 #include <QQmlExtensionPlugin>
 
 #include "previewimageprovider.h"
+#include "vaultpreviewimageprovider.h"
+#include "../historymodel.h"
 
 void qml_register_types_org_kde_plasma_private_clipboard();
 
@@ -28,6 +30,7 @@ public:
     void initializeEngine(QQmlEngine *engine, const char * /*uri*/) override
     {
         engine->addImageProvider(QStringLiteral("klipperpreview"), new PreviewImageProvider);
+        engine->addImageProvider(QStringLiteral("klippervaultpreview"), new VaultPreviewImageProvider(HistoryModel::self()));
     }
 };
 

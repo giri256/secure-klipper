@@ -23,12 +23,14 @@ target_sources(klipperplugin
     PRIVATE
         klipperplugin.cpp
         previewimageprovider.cpp previewimageprovider.h
+        vaultpreviewimageprovider.cpp vaultpreviewimageprovider.h
         declarativehistorymodel.cpp declarativehistorymodel.h
         klipperinterface.cpp klipperinterface.h
 )
 target_link_libraries(klipperplugin
     PRIVATE
         Qt::Qml
+        Qt::Concurrent
         klipper
 )
 
