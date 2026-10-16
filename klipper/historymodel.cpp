@@ -17,6 +17,7 @@
 #include <QDataStream>
 #include <QDir>
 #include <QFile>
+#include <QFileInfo>
 #include <QFutureWatcher>
 #include <QImageReader>
 #include <QMimeData>
@@ -817,6 +818,11 @@ bool HistoryModel::loadHistory()
     for (const QString &trash : QDir(m_dbFolder).entryList({u"data.trash-*"_s}, QDir::Dirs | QDir::NoDotAndDotDot)) {
         QDir(m_dbFolder + u'/' + trash).removeRecursively();
     }
+    // removeFolders() retires individual payload directories before deleting them asynchronously.
+    // Clean up any such retired directories left behind by a crash or forced process exit.
+    for (const QString &trash : dataDir.entryList({u"vault-trash-*"_s}, QDir::Dirs | QDir::NoDotAndDotDot)) {
+        QDir(dataDir.filePath(trash)).removeRecursively();
+    }
 
     // Try to reuse the previous connection
     m_db = QSqlDatabase::database(u"klipper"_s);
@@ -1146,14 +1152,43 @@ void HistoryModel::removeFolders(const QStringList &paths)
     if (paths.empty()) {
         return;
     }
+
+    // A payload directory is named after its content UUID. It may be recreated by a
+    // promotion or a re-copy while background cleanup is still running. Never let a
+    // delayed recursive delete target that live path: atomically rename each retired
+    // directory first, then delete only the unique retired name on the worker thread.
+    QStringList retiredPaths;
+    retiredPaths.reserve(paths.size());
+    for (const QString &path : paths) {
+        const QFileInfo info(path);
+        if (!info.isDir()) {
+            continue;
+        }
+        QDir parent(info.absolutePath());
+        const QString retiredName = u"vault-trash-"_s + randomUuid();
+        if (parent.rename(info.fileName(), retiredName)) {
+            retiredPaths.append(parent.filePath(retiredName));
+        } else {
+            // Do not schedule deletion against the reusable original name on failure.
+            // This rare fallback is synchronous to preserve the same no-race guarantee.
+            qCWarning(KLIPPER_LOG) << "Could not retire clipboard payload directory" << path;
+            if (!QDir(info.absoluteFilePath()).removeRecursively()) {
+                qCWarning(KLIPPER_LOG) << "Could not remove clipboard payload directory" << path;
+            }
+        }
+    }
+    if (retiredPaths.empty()) {
+        return;
+    }
+
     ++m_pendingJobs;
     auto watcher = new QFutureWatcher<void>(this);
     connect(watcher, &QFutureWatcher<void>::finished, this, [this, watcher] {
         --m_pendingJobs;
         watcher->deleteLater();
     });
-    watcher->setFuture(QtConcurrent::run([paths] {
-        for (const QString &path : paths) {
+    watcher->setFuture(QtConcurrent::run([retiredPaths] {
+        for (const QString &path : retiredPaths) {
             QDir(path).removeRecursively();
         }
     }));
