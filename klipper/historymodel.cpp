@@ -26,6 +26,7 @@
 #include <QSqlError>
 #include <QSqlQuery>
 #include <QStandardPaths>
+#include <QTemporaryFile>
 #include <QThread>
 #include <QtConcurrentRun>
 
@@ -34,6 +35,7 @@
 #include <KMessageBox>
 
 #include "config-klipper.h"
+#include "clipboarddatafile.h"
 #include "historyitem.h"
 #include "klipper_debug.h"
 #include "klippersettings.h"
@@ -258,6 +260,7 @@ HistoryModel::HistoryModel()
 
 HistoryModel::~HistoryModel()
 {
+    clearDragExports();
     if (!m_bKeepContents) {
         m_db.close();
         QFile(m_db.databaseName()).remove();
@@ -452,12 +455,12 @@ QVariant HistoryModel::data(const QModelIndex &index, int role) const
             if (item->isLocked()) {
                 return QString();
             }
-            if (const QSize size = item->imageSize(); size.isValid() && item->text().isEmpty()) {
+            if (const QSize size = item->imageSize(); size.isValid() && (item->allTypes() & HistoryItemType::Image)) {
                 return QString(u"▨ " + i18nc("@info:tooltip width x height", "%1x%2", QString::number(size.width()), QString::number(size.height())));
             }
             return item->text();
         case ImageUrlRole:
-            if (!item->isLocked() && item->imageSize().isValid() && item->text().isEmpty()) {
+            if (!item->isLocked() && (item->allTypes() & HistoryItemType::Image)) {
                 // The QML image provider decrypts the preview into memory only. Do not
                 // materialize an older image as a plaintext file on persistent storage.
                 return QUrl(u"image://klippervaultpreview/"_s + item->uuid());
@@ -466,9 +469,12 @@ QVariant HistoryModel::data(const QModelIndex &index, int role) const
         case ImageSizeRole:
             return item->imageSize();
         case TypeRole:
-            return QVariant::fromValue<HistoryItemType>(item->imageSize().isValid() && item->text().isEmpty() ? HistoryItemType::Image : HistoryItemType::Text);
+            return QVariant::fromValue<HistoryItemType>(item->type());
         case TypeIntRole:
-            return int(item->imageSize().isValid() && item->text().isEmpty() ? HistoryItemType::Image : HistoryItemType::Text);
+            // An encrypted file copied from a file manager is normally a URL
+            // entry (text/uri-list), not an image/png blob. Preserve its URL
+            // delegate across encryption so QML can keep showing file previews.
+            return int(item->type());
         default:
             break;
         }
@@ -479,7 +485,9 @@ QVariant HistoryModel::data(const QModelIndex &index, int role) const
         if (item->type() == HistoryItemType::Image) {
             QSqlQuery query(u"SELECT data_uuid FROM aux WHERE uuid='%1' AND (mimetype='%2')"_s.arg(item->uuid(), s_imageFormat), m_db);
             if (query.exec() && query.isSelect() && query.next()) {
-                QSize size = QImageReader(QString(m_dbFolder + u"/data/" + item->uuid() + u'/' + query.value(0).toString())).size();
+                const QString folder = m_dbFolder + u"/data/" + item->uuid();
+                const QString path = ClipboardDataFile::path(folder, query.value(0).toString(), QStringView(u"image/png"));
+                QSize size = QImageReader(path).size();
                 return QString(u"▨ " + i18nc("@info:tooltip width x height", "%1x%2", QString::number(size.width()), QString::number(size.height())));
             }
         }
@@ -491,7 +499,8 @@ QVariant HistoryModel::data(const QModelIndex &index, int role) const
         }
         QSqlQuery query(u"SELECT data_uuid FROM aux WHERE uuid='%1' AND (mimetype='%2')"_s.arg(item->uuid(), s_imageFormat), m_db);
         if (query.exec() && query.isSelect() && query.next()) {
-            return QUrl::fromLocalFile(m_dbFolder + u"/data/" + item->uuid() + u'/' + query.value(0).toString());
+            const QString folder = m_dbFolder + u"/data/" + item->uuid();
+            return QUrl::fromLocalFile(ClipboardDataFile::path(folder, query.value(0).toString(), QStringView(u"image/png")));
         }
         return QUrl();
     }
@@ -501,7 +510,8 @@ QVariant HistoryModel::data(const QModelIndex &index, int role) const
         }
         QSqlQuery query(u"SELECT data_uuid FROM aux WHERE uuid='%1' AND (mimetype='%2')"_s.arg(item->uuid(), s_imageFormat), m_db);
         if (query.exec() && query.isSelect() && query.next()) {
-            return QImageReader(m_dbFolder + u"/data/" + item->uuid() + u'/' + query.value(0).toString()).size();
+            const QString folder = m_dbFolder + u"/data/" + item->uuid();
+            return QImageReader(ClipboardDataFile::path(folder, query.value(0).toString(), QStringView(u"image/png"))).size();
         }
         return QSize();
     }
@@ -876,6 +886,7 @@ bool HistoryModel::loadHistory()
     if (!m_vault.load(m_db)) {
         qCWarning(KLIPPER_LOG) << "History encryption is unavailable";
     }
+    migrateImageFileExtensions();
     m_autoLockTimer.stop();
 
     if (!m_bKeepContents) {
@@ -938,6 +949,26 @@ bool HistoryModel::saveClipboardHistory()
 {
     QSqlQuery query(u"PRAGMA wal_checkpoint"_s, m_db);
     return query.exec();
+}
+
+void HistoryModel::migrateImageFileExtensions()
+{
+    if (!m_db.isOpen()) {
+        return;
+    }
+    QSqlQuery query(m_db);
+    query.prepare(u"SELECT uuid, data_uuid FROM aux WHERE mimetype=?"_s);
+    query.addBindValue(s_imageFormat.toString());
+    if (!query.exec()) {
+        return;
+    }
+    while (query.next()) {
+        const QString uuid = query.value(0).toString();
+        const QString dataUuid = query.value(1).toString();
+        if (!uuid.isEmpty() && !dataUuid.isEmpty()) {
+            ClipboardDataFile::migrateLegacyFile(dataFolder(uuid), dataUuid, QStringView(u"image/png"));
+        }
+    }
 }
 
 void HistoryModel::loadSettings()
@@ -1030,11 +1061,12 @@ void HistoryModel::moveToTop(qsizetype row)
     endMoveRows();
 }
 
-void HistoryModel::saveToFile(QStringView dbFolder, const QByteArray &data, QStringView newUuid, QStringView dataUuid)
+void HistoryModel::saveToFile(QStringView dbFolder, const QByteArray &data, QStringView newUuid, QStringView dataUuid, bool imageData)
 {
     const QString folderPath = dbFolder + u"/data/" + newUuid;
     QDir().mkpath(folderPath);
-    QSaveFile file(folderPath + u'/' + dataUuid);
+    const QString fileName = ClipboardDataFile::fileName(dataUuid, imageData ? QStringView(u"image/png") : QStringView());
+    QSaveFile file(folderPath + u'/' + fileName);
     if (!file.open(QIODevice::WriteOnly)) {
         qCWarning(KLIPPER_LOG) << file.errorString() << folderPath;
         return;
@@ -1287,6 +1319,103 @@ QByteArray HistoryModel::vaultImagePreviewData(const QString &uuid) const
     return imageData;
 }
 
+QUrl HistoryModel::imageFileUrlForDrag(const QString &uuid)
+{
+    // The drag handler is driven by QML on the model thread. Refuse calls from any
+    // other thread rather than racing the live row vector or SQLite connection.
+    if (QThread::currentThread() != thread()) {
+        return {};
+    }
+    const qsizetype row = indexOf(uuid);
+    if (row < 0) {
+        return {};
+    }
+    const HistoryItemPtr &item = m_items.at(row);
+    if (item->isLocked() || !(item->allTypes() & HistoryItemType::Image)) {
+        return {};
+    }
+
+    QByteArray imageData;
+    if (!item->isEncrypted()) {
+        QSqlQuery query(m_db);
+        query.prepare(u"SELECT data_uuid FROM aux WHERE uuid=? AND mimetype=?"_s);
+        query.addBindValue(item->uuid());
+        query.addBindValue(s_imageFormat.toString());
+        if (!query.exec() || !query.next()) {
+            return {};
+        }
+        const QString dataUuid = query.value(0).toString();
+        const QString folder = dataFolder(item->uuid());
+        ClipboardDataFile::migrateLegacyFile(folder, dataUuid, QStringView(u"image/png"));
+        const QString path = ClipboardDataFile::path(folder, dataUuid, QStringView(u"image/png"));
+        if (path.endsWith(u".png")) {
+            return QUrl::fromLocalFile(path);
+        }
+        QFile file(path);
+        if (!file.open(QIODevice::ReadOnly)) {
+            return {};
+        }
+        imageData = file.readAll();
+    } else {
+        // Encrypted payloads are never made persistently plaintext just to support
+        // file-path consumers. Materialize a short-lived private runtime PNG instead.
+        imageData = vaultImagePreviewData(item->uuid());
+    }
+    if (imageData.isEmpty() || QImage::fromData(imageData, "PNG").isNull()) {
+        HistoryVault::wipe(imageData);
+        return {};
+    }
+
+    const QString runtimePath = QStandardPaths::writableLocation(QStandardPaths::RuntimeLocation);
+    if (runtimePath.isEmpty()) {
+        HistoryVault::wipe(imageData);
+        return {};
+    }
+    const QString exportDir = runtimePath + u"/clipboard-vault-drag";
+    if (!QDir().mkpath(exportDir)) {
+        HistoryVault::wipe(imageData);
+        return {};
+    }
+    constexpr auto privatePermissions = QFileDevice::ReadOwner | QFileDevice::WriteOwner | QFileDevice::ExeOwner;
+    QFile::setPermissions(exportDir, privatePermissions);
+
+    QTemporaryFile file(exportDir + u"/image-XXXXXX.png"_s);
+    if (!file.open()) {
+        HistoryVault::wipe(imageData);
+        return {};
+    }
+    file.setPermissions(QFileDevice::ReadOwner | QFileDevice::WriteOwner);
+    if (file.write(imageData) != imageData.size() || !file.flush()) {
+        const QString failedPath = file.fileName();
+        file.close();
+        QFile::remove(failedPath);
+        HistoryVault::wipe(imageData);
+        return {};
+    }
+    const QString exportPath = file.fileName();
+    file.setAutoRemove(false);
+    file.close();
+    HistoryVault::wipe(imageData);
+    m_dragExportPaths.insert(exportPath);
+    return QUrl::fromLocalFile(exportPath);
+}
+
+void HistoryModel::releaseImageFileUrlForDrag(const QUrl &url)
+{
+    const QString path = url.toLocalFile();
+    if (!path.isEmpty() && m_dragExportPaths.remove(path)) {
+        QFile::remove(path);
+    }
+}
+
+void HistoryModel::clearDragExports()
+{
+    for (const QString &path : std::as_const(m_dragExportPaths)) {
+        QFile::remove(path);
+    }
+    m_dragExportPaths.clear();
+}
+
 qsizetype HistoryModel::plaintextItems() const
 {
     return m_plaintextItems;
@@ -1405,7 +1534,7 @@ bool HistoryModel::applyVault(const QList<qsizetype> &demoteRows, const QList<qs
                 const QString dataUuid = query.value(1).toString();
                 auxRows.emplace_back(mimeType, dataUuid);
                 if (!blobs.contains(dataUuid)) {
-                    QFile file(dataFolder(oldUuid) + u'/' + dataUuid);
+                    QFile file(ClipboardDataFile::path(dataFolder(oldUuid), dataUuid, mimeType));
                     blobs.insert(dataUuid, file.open(QIODevice::ReadOnly) ? file.readAll() : QByteArray());
                 }
                 if (mimeType == s_imageFormat) {
@@ -1492,8 +1621,14 @@ bool HistoryModel::applyVault(const QList<qsizetype> &demoteRows, const QList<qs
             HistoryVault::wipe(*metaData);
 
             const QString &contentUuid = meta->contentUuid;
+            QSet<QString> imageDataUuids;
+            for (const auto &[mimeType, dataUuid] : std::as_const(auxRows)) {
+                if (mimeType == s_imageFormat) {
+                    imageDataUuids.insert(dataUuid);
+                }
+            }
             for (auto it = blobs.begin(); it != blobs.end(); ++it) {
-                saveToFile(m_dbFolder, it.value(), contentUuid, it.key());
+                saveToFile(m_dbFolder, it.value(), contentUuid, it.key(), imageDataUuids.contains(it.key()));
                 HistoryVault::wipe(it.value());
             }
             writtenFolders.append(dataFolder(contentUuid));
@@ -1641,6 +1776,7 @@ void HistoryModel::unlockVault(const QString &password)
 void HistoryModel::lockVault()
 {
     m_autoLockTimer.stop();
+    clearDragExports();
     if (!m_vault.isUnlocked()) {
         return;
     }
@@ -1688,6 +1824,7 @@ void HistoryModel::changeVaultPassword(const QString &oldPassword, const QString
 
 void HistoryModel::resetVault()
 {
+    clearDragExports();
     if (!m_vault.isConfigured() || m_vaultBusy) {
         return;
     }

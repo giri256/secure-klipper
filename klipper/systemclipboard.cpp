@@ -9,6 +9,8 @@
 
 #include "systemclipboard.h"
 
+#include "clipboarddatafile.h"
+
 #include <chrono>
 
 #include <QApplication>
@@ -131,7 +133,8 @@ void DatabaseRecordToMimeDataJob::start()
         if (mimeType.isEmpty() || dataUuid.isEmpty()) {
             continue;
         }
-        const QString dataPath = QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation) + u"/klipper/data/" + m_uuid + u'/' + dataUuid;
+        const QString dataFolder = QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation) + u"/klipper/data/" + m_uuid;
+        const QString dataPath = ClipboardDataFile::path(dataFolder, dataUuid, mimeType);
         auto job = KIO::open(QUrl::fromLocalFile(dataPath), QIODevice::ReadOnly);
         connect(job, &KIO::FileJob::open, this, [this, job, mimeType] {
             connect(job, &KIO::FileJob::data, this, [this, job, mimeType](KJob *, const QByteArray &data) {

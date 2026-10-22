@@ -3213,3 +3213,777 @@ index 2e252c8..27aade4 100644
 -- 
 2.55.0
 
+From 497113f31b4c65c61dd2e07d61a444b2c2816ac9 Mon Sep 17 00:00:00 2001
+From: giri256 <80974392+giri256@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 16:47:08 +0000
+Subject: [PATCH] Fix image URLs and clipboard image handoff
+
+---
+ klipper/autotests/historyvaulttest.cpp        |  80 ++++++++-
+ klipper/autotests/v3migrationtest.py          |   5 +-
+ klipper/clipboarddatafile.h                   |  78 +++++++++
+ .../declarative/declarativehistorymodel.cpp   |  10 ++
+ klipper/declarative/declarativehistorymodel.h |   3 +
+ klipper/declarative/qml/ImageItemDelegate.qml |  27 ++-
+ klipper/historyitem.cpp                       |   9 +-
+ klipper/historymodel.cpp                      | 159 ++++++++++++++++--
+ klipper/historymodel.h                        |  10 +-
+ klipper/systemclipboard.cpp                   |   5 +-
+ klipper/updateclipboardjob.cpp                |   6 +-
+ 11 files changed, 364 insertions(+), 28 deletions(-)
+ create mode 100644 klipper/clipboarddatafile.h
+
+diff --git a/klipper/autotests/historyvaulttest.cpp b/klipper/autotests/historyvaulttest.cpp
+index d69f15f..98fcdd6 100644
+--- a/klipper/autotests/historyvaulttest.cpp
++++ b/klipper/autotests/historyvaulttest.cpp
+@@ -22,6 +22,7 @@
+ #include <QSqlDatabase>
+ #include <QSqlQuery>
+ #include <QStandardPaths>
++#include <QTemporaryDir>
+ #include <QTest>
+ 
+ using namespace Qt::StringLiterals;
+@@ -167,18 +168,57 @@ void HistoryVaultTest::testModelVault()
+     QCOMPARE(history->plaintextItems(), 5);
+     QVERIFY(!history->isVaultConfigured());
+ 
+-    // Oldest first: an image, then 11 text entries. Newest is "secret-item-10".
++    // Oldest first: a binary image and a file URL, then 10 text entries.
++    // A file copied from a file manager is text/uri-list, not image/png.
+     QImage image(10, 7, QImage::Format_RGB32);
+     image.fill(Qt::red);
+     auto imageData = std::make_unique<QMimeData>();
+     imageData->setImageData(image);
++    // Screenshot/file producers often attach a filename or text/uri-list next to
++    // the binary image. It must still receive the image delegate and preview.
++    imageData->setText(u"clipboard-screenshot.png"_s);
+     QVERIFY(history->insert(imageData.get()));
+     QTRY_COMPARE(history->pendingJobs(), 0);
+-    for (int i = 0; i <= 10; ++i) {
++
++    QTemporaryDir urlImageDirectory;
++    QVERIFY(urlImageDirectory.isValid());
++    const QString urlImagePath = urlImageDirectory.filePath(u"copied-file-preview.png"_s);
++    QImage urlImage(11, 8, QImage::Format_RGB32);
++    urlImage.fill(Qt::blue);
++    QVERIFY(urlImage.save(urlImagePath, "PNG"));
++    const QUrl urlImageUrl = QUrl::fromLocalFile(urlImagePath);
++    QMimeData urlImageData;
++    urlImageData.setUrls({urlImageUrl});
++    QVERIFY(history->insert(&urlImageData));
++    QTRY_COMPARE(history->pendingJobs(), 0);
++
++    for (int i = 0; i <= 9; ++i) {
+         QVERIFY(history->insert(u"secret-item-%1"_s.arg(i, 2, 10, QLatin1Char('0'))));
+         QTRY_COMPARE(history->pendingJobs(), 0);
+     }
+     QCOMPARE(history->rowCount(), 12);
++    // Image payloads have a format-bearing suffix for tools which consume file URIs.
++    // Older extensionless entries should be migrated when history is loaded.
++    QCOMPARE(history->index(11).data(HistoryModel::TypeIntRole).toInt(), int(HistoryItemType::Image));
++    QVERIFY(text(history.get(), 11).contains(u"10x7"_s));
++    const QString plainImageUuid = history->index(11).data(HistoryModel::UuidRole).toString();
++    QUrl plainImageUrl = history->index(11).data(HistoryModel::ImageUrlRole).toUrl();
++    QVERIFY(plainImageUrl.isLocalFile());
++    QVERIFY(plainImageUrl.toLocalFile().endsWith(u".png"));
++    QVERIFY(QFile::exists(plainImageUrl.toLocalFile()));
++    const QFileInfo plainImageInfo(plainImageUrl.toLocalFile());
++    const QString legacyImagePath = plainImageInfo.dir().filePath(plainImageInfo.completeBaseName());
++    QVERIFY(QFile::rename(plainImageUrl.toLocalFile(), legacyImagePath));
++    QVERIFY(!QFile::exists(plainImageUrl.toLocalFile()));
++    QVERIFY(history->loadHistory());
++    QCOMPARE(history->index(11).data(HistoryModel::UuidRole).toString(), plainImageUuid);
++    plainImageUrl = history->index(11).data(HistoryModel::ImageUrlRole).toUrl();
++    QVERIFY(plainImageUrl.toLocalFile().endsWith(u".png"));
++    QVERIFY(QFile::exists(plainImageUrl.toLocalFile()));
++    QCOMPARE(QImage(plainImageUrl.toLocalFile()).size(), QSize(10, 7));
++    const QString urlImageUuid = history->index(10).data(HistoryModel::UuidRole).toString();
++    QCOMPARE(history->index(10).data(HistoryModel::TypeIntRole).toInt(), int(HistoryItemType::Url));
++    QCOMPARE(text(history.get(), 10), urlImageUrl.toString(QUrl::FullyEncoded));
+     // Without a vault nothing is encrypted
+     QVERIFY(allStoredBytes().contains("secret-item-00"));
+ 
+@@ -195,16 +235,32 @@ void HistoryVaultTest::testModelVault()
+         QCOMPARE(history->index(row).data(HistoryModel::EncryptedRole).toBool(), row >= 5);
+     }
+     // Unlocked: encrypted entries still show their text (and the image its size)
+-    QCOMPARE(text(history.get(), 5), u"secret-item-05"_s);
++    QCOMPARE(text(history.get(), 5), u"secret-item-04"_s);
+     QCOMPARE(text(history.get(), 11), u"▨ 10x7"_s);
+     QCOMPARE(history->index(11).data(HistoryModel::ImageSizeRole).toSize(), QSize(10, 7));
+     QCOMPARE(history->index(11).data(HistoryModel::TypeIntRole).toInt(), int(HistoryItemType::Image));
++    const int encryptedUrlRow = history->indexOf(urlImageUuid);
++    QVERIFY(encryptedUrlRow >= 0);
++    QVERIFY(history->index(encryptedUrlRow).data(HistoryModel::EncryptedRole).toBool());
++    QCOMPARE(history->index(encryptedUrlRow).data(HistoryModel::TypeIntRole).toInt(), int(HistoryItemType::Url));
++    QCOMPARE(text(history.get(), encryptedUrlRow), urlImageUrl.toString(QUrl::FullyEncoded));
++    const QString encryptedUrlStorageUuid = history->index(encryptedUrlRow).data(HistoryModel::UuidRole).toString();
+     const QString encryptedImageUuid = history->index(11).data(HistoryModel::UuidRole).toString();
+     QCOMPARE(history->index(11).data(HistoryModel::ImageUrlRole).toUrl().scheme(), u"image"_s);
+     QByteArray encryptedImagePreview = history->vaultImagePreviewData(encryptedImageUuid);
+     QVERIFY(!encryptedImagePreview.isEmpty());
+     QCOMPARE(QImage::fromData(encryptedImagePreview).size(), QSize(10, 7));
+     HistoryVault::wipe(encryptedImagePreview);
++    const QUrl encryptedDragUrl = history->imageFileUrlForDrag(encryptedImageUuid);
++    QVERIFY(encryptedDragUrl.isLocalFile());
++    QVERIFY(encryptedDragUrl.toLocalFile().endsWith(u".png"));
++    QVERIFY(QFile::exists(encryptedDragUrl.toLocalFile()));
++    QCOMPARE(QImage(encryptedDragUrl.toLocalFile()).size(), QSize(10, 7));
++    const auto dragPermissions = QFileInfo(encryptedDragUrl.toLocalFile()).permissions();
++    QVERIFY(!(dragPermissions & (QFileDevice::ReadGroup | QFileDevice::WriteGroup | QFileDevice::ExeGroup |
++                                 QFileDevice::ReadOther | QFileDevice::WriteOther | QFileDevice::ExeOther)));
++    history->releaseImageFileUrlForDrag(encryptedDragUrl);
++    QVERIFY(!QFile::exists(encryptedDragUrl.toLocalFile()));
+ 
+     // --- on disk: no plaintext of encrypted entries anywhere (db, WAL, data/)
+     {
+@@ -221,10 +277,11 @@ void HistoryVaultTest::testModelVault()
+     }
+     QCOMPARE(QDir(klipperFolder() + u"/data").entryList(QDir::Dirs | QDir::NoDotAndDotDot).size(), 5);
+     const QByteArray onDisk = allStoredBytes();
+-    for (int i = 0; i <= 10; ++i) {
++    for (int i = 0; i <= 9; ++i) {
+         const QByteArray needle = u"secret-item-%1"_s.arg(i, 2, 10, QLatin1Char('0')).toUtf8();
+-        QVERIFY2(onDisk.contains(needle) == (i >= 6), needle.constData()); // items 06..10 are the plain top 5
++        QVERIFY2(onDisk.contains(needle) == (i >= 5), needle.constData()); // items 05..09 are the plain top 5
+     }
++    QVERIFY(!onDisk.contains(urlImageUrl.toString(QUrl::FullyEncoded).toUtf8())); // URL metadata is encrypted too
+     // Encrypted rows don't reveal the content hash either
+     QVERIFY(!onDisk.contains(QCryptographicHash::hash("secret-item-00", QCryptographicHash::Sha1).toHex()));
+     QCOMPARE(QFileInfo(klipperFolder()).permissions() & (QFileDevice::ReadOther | QFileDevice::ReadGroup), QFileDevice::Permissions());
+@@ -236,6 +293,11 @@ void HistoryVaultTest::testModelVault()
+     QCOMPARE(history->lockedCount(), 7);
+     QCOMPARE(history->index(11).data(HistoryModel::TypeIntRole).toInt(), int(HistoryItemType::Text));
+     QVERIFY(history->index(11).data(HistoryModel::ImageUrlRole).toUrl().isEmpty());
++    QVERIFY(!history->imageFileUrlForDrag(encryptedImageUuid).isValid());
++    const int lockedUrlRow = history->indexOf(encryptedUrlStorageUuid);
++    QVERIFY(lockedUrlRow >= 0);
++    QVERIFY(history->index(lockedUrlRow).data(HistoryModel::LockedRole).toBool());
++    QCOMPARE(history->index(lockedUrlRow).data(HistoryModel::TypeIntRole).toInt(), int(HistoryItemType::Text));
+     QVERIFY(history->index(8).data(HistoryModel::LockedRole).toBool());
+     QCOMPARE(text(history.get(), 8), QString());
+     {
+@@ -262,7 +324,7 @@ void HistoryVaultTest::testModelVault()
+         const QByteArray bytes = allStoredBytes();
+         QVERIFY(bytes.contains("secret-item-11"));
+         QVERIFY(!bytes.contains("secret-item-06"));
+-        QVERIFY(!bytes.contains("secret-item-07"));
++        QVERIFY(!bytes.contains("secret-item-05"));
+     }
+ 
+     // --- unlock
+@@ -279,6 +341,11 @@ void HistoryVaultTest::testModelVault()
+     QCOMPARE(text(history.get(), 0), u"secret-item-01"_s);
+     QCOMPARE(text(history.get(), 12), u"▨ 10x7"_s);
+     QCOMPARE(history->index(12).data(HistoryModel::TypeIntRole).toInt(), int(HistoryItemType::Image));
++    const int unlockedUrlRow = history->indexOf(urlImageUuid);
++    QVERIFY(unlockedUrlRow >= 0);
++    QCOMPARE(history->index(unlockedUrlRow).data(HistoryModel::EncryptedRole).toBool(), true);
++    QCOMPARE(history->index(unlockedUrlRow).data(HistoryModel::TypeIntRole).toInt(), int(HistoryItemType::Url));
++    QCOMPARE(text(history.get(), unlockedUrlRow), urlImageUrl.toString(QUrl::FullyEncoded));
+     QCOMPARE(history->index(12).data(HistoryModel::ImageUrlRole).toUrl().scheme(), u"image"_s);
+     QByteArray unlockedImagePreview = history->vaultImagePreviewData(history->index(12).data(HistoryModel::UuidRole).toString());
+     QVERIFY(!unlockedImagePreview.isEmpty());
+@@ -292,6 +359,7 @@ void HistoryVaultTest::testModelVault()
+     QCOMPARE(history->index(0).data(HistoryModel::TypeIntRole).toInt(), int(HistoryItemType::Image));
+     const QUrl imageUrl = history->index(0).data(HistoryModel::ImageUrlRole).toUrl();
+     QVERIFY(QFile::exists(imageUrl.toLocalFile()));
++    QVERIFY(imageUrl.toLocalFile().endsWith(u".png"));
+     QCOMPARE(QImage(imageUrl.toLocalFile()).size(), QSize(10, 7));
+     QTRY_VERIFY(history->index(5).data(HistoryModel::EncryptedRole).toBool()); // the displaced entry
+     for (int row = 0; row < history->rowCount(); ++row) {
+diff --git a/klipper/autotests/v3migrationtest.py b/klipper/autotests/v3migrationtest.py
+index c295031..600707c 100755
+--- a/klipper/autotests/v3migrationtest.py
++++ b/klipper/autotests/v3migrationtest.py
+@@ -84,9 +84,10 @@ class V3MigrationTest(unittest.TestCase):
+             self.assertTrue(os.path.exists(target_db))
+             self.assertTrue(os.path.exists(os.path.join(temp_dir, "data")))
+             uuid = "8f9353dabfdcf9aca5a901cd2c4ae6717cac5adc"
++            image_path = os.path.join(temp_dir, "data", uuid, uuid + ".png")
+             self.assertTrue(os.path.exists(os.path.join(temp_dir, "data", uuid)))
+-            self.assertTrue(os.path.exists(os.path.join(temp_dir, "data", uuid, uuid)))
+-            pixbuf = GdkPixbuf.Pixbuf.new_from_file(os.path.join(temp_dir, "data", uuid, uuid))
++            self.assertTrue(os.path.exists(image_path))
++            pixbuf = GdkPixbuf.Pixbuf.new_from_file(image_path)
+             self.assertIsNotNone(pixbuf)
+             self.assertEqual(pixbuf.get_width(), 1610)
+             self.assertEqual(pixbuf.get_height(), 1329)
+diff --git a/klipper/clipboarddatafile.h b/klipper/clipboarddatafile.h
+new file mode 100644
+index 0000000..d0891b1
+--- /dev/null
++++ b/klipper/clipboarddatafile.h
+@@ -0,0 +1,78 @@
++/*
++    SPDX-FileCopyrightText: 2026 giri256
++
++    SPDX-License-Identifier: GPL-2.0-or-later
++*/
++#pragma once
++
++#include <QFile>
++#include <QFileInfo>
++#include <QString>
++#include <QStringView>
++
++// Clipboard images are encoded as PNG by UpdateDatabaseJob. Keep MIME data_uuid
++// values stable in SQLite, but give image payload files a useful suffix so
++// file-path paste/drag consumers can identify the format without sniffing bytes.
++namespace ClipboardDataFile
++{
++inline QString extensionForMimeType(QStringView mimeType)
++{
++    if (mimeType == u"image/png") {
++        return QStringLiteral(".png");
++    }
++    if (mimeType == u"image/jpeg") {
++        return QStringLiteral(".jpg");
++    }
++    if (mimeType == u"image/webp") {
++        return QStringLiteral(".webp");
++    }
++    if (mimeType == u"image/gif") {
++        return QStringLiteral(".gif");
++    }
++    if (mimeType == u"image/bmp") {
++        return QStringLiteral(".bmp");
++    }
++    if (mimeType == u"image/tiff") {
++        return QStringLiteral(".tiff");
++    }
++    return {};
++}
++
++inline QString fileName(QStringView dataUuid, QStringView mimeType)
++{
++    return QString(dataUuid) + extensionForMimeType(mimeType);
++}
++
++// Read the new suffixed path first, then fall back to the pre-migration
++// extensionless layout. The fallback keeps a failed/partial rename readable.
++inline QString path(const QString &folder, QStringView dataUuid, QStringView mimeType)
++{
++    const QString basePath = QString(folder) + u'/' + QString(dataUuid);
++    const QString extension = extensionForMimeType(mimeType);
++    if (!extension.isEmpty()) {
++        const QString suffixedPath = basePath + extension;
++        if (QFileInfo::exists(suffixedPath)) {
++            return suffixedPath;
++        }
++    }
++    return basePath;
++}
++
++inline bool migrateLegacyFile(const QString &folder, QStringView dataUuid, QStringView mimeType)
++{
++    const QString extension = extensionForMimeType(mimeType);
++    if (extension.isEmpty()) {
++        return false;
++    }
++
++    const QString basePath = QString(folder) + u'/' + QString(dataUuid);
++    const QString suffixedPath = basePath + extension;
++    if (QFileInfo::exists(suffixedPath)) {
++        return true;
++    }
++    if (!QFileInfo::exists(basePath)) {
++        return false;
++    }
++    return QFile::rename(basePath, suffixedPath);
++}
++}
+diff --git a/klipper/declarative/declarativehistorymodel.cpp b/klipper/declarative/declarativehistorymodel.cpp
+index 985f188..e5bc903 100644
+--- a/klipper/declarative/declarativehistorymodel.cpp
++++ b/klipper/declarative/declarativehistorymodel.cpp
+@@ -98,6 +98,16 @@ void DeclarativeHistoryModel::invokeAction(const QString &uuid)
+     }
+ }
+ 
++QUrl DeclarativeHistoryModel::imageFileUrlForDrag(const QString &uuid)
++{
++    return m_model->imageFileUrlForDrag(uuid);
++}
++
++void DeclarativeHistoryModel::releaseImageFileUrlForDrag(const QUrl &url)
++{
++    m_model->releaseImageFileUrlForDrag(url);
++}
++
+ bool DeclarativeHistoryModel::vaultConfigured() const
+ {
+     return m_model->isVaultConfigured();
+diff --git a/klipper/declarative/declarativehistorymodel.h b/klipper/declarative/declarativehistorymodel.h
+index 8ddfa74..b06ef58 100644
+--- a/klipper/declarative/declarativehistorymodel.h
++++ b/klipper/declarative/declarativehistorymodel.h
+@@ -8,6 +8,7 @@
+ 
+ #include <QPropertyNotifier>
+ #include <QSortFilterProxyModel>
++#include <QUrl>
+ #include <qqmlregistration.h>
+ 
+ class HistoryModel;
+@@ -51,6 +52,8 @@ public:
+     Q_INVOKABLE void clearHistory();
+ 
+     Q_INVOKABLE void invokeAction(const QString &uuid);
++    Q_INVOKABLE QUrl imageFileUrlForDrag(const QString &uuid);
++    Q_INVOKABLE void releaseImageFileUrlForDrag(const QUrl &url);
+ 
+     bool vaultConfigured() const;
+     bool vaultUnlocked() const;
+diff --git a/klipper/declarative/qml/ImageItemDelegate.qml b/klipper/declarative/qml/ImageItemDelegate.qml
+index fdbb0c9..f407358 100644
+--- a/klipper/declarative/qml/ImageItemDelegate.qml
++++ b/klipper/declarative/qml/ImageItemDelegate.qml
+@@ -13,14 +13,37 @@ import org.kde.kirigami as Kirigami
+ 
+ ClipboardItemDelegate {
+     id: menuItem
++
++    // The thumbnail source is for painting only. In particular, an unlocked
++    // encrypted thumbnail uses image://, which cannot be consumed as a file URI.
++    // Prepare a real PNG path only while a drag is active, then release it.
++    property url dragImageUrl: ""
++
++    Connections {
++        target: menuItem.dragHandler
++        function onActiveChanged() {
++            const view = menuItem.ListView.view
++            const historyModel = view ? view.clipboardMenu.model : null
++            if (!historyModel) {
++                return
++            }
++            if (menuItem.dragHandler.active) {
++                menuItem.dragImageUrl = historyModel.imageFileUrlForDrag(menuItem.uuid)
++            } else if (menuItem.dragImageUrl.toString() !== "") {
++                historyModel.releaseImageFileUrlForDrag(menuItem.dragImageUrl)
++                menuItem.dragImageUrl = ""
++            }
++        }
++    }
++
+     mainItem: Item {
+         implicitHeight: childrenRect.height
+ 
+-        Drag.active: menuItem.dragHandler.active
++        Drag.active: menuItem.dragHandler.active && menuItem.dragImageUrl.toString() !== ""
+         Drag.dragType: Drag.Automatic
+         Drag.supportedActions: Qt.CopyAction
+         Drag.mimeData: {
+-            "text/uri-list": [previewImage.source],
++            "text/uri-list": [menuItem.dragImageUrl.toString()],
+         }
+ 
+         Image {
+diff --git a/klipper/historyitem.cpp b/klipper/historyitem.cpp
+index 936bb7f..7f289b3 100644
+--- a/klipper/historyitem.cpp
++++ b/klipper/historyitem.cpp
+@@ -37,12 +37,15 @@ HistoryItem::~HistoryItem() = default;
+ 
+ HistoryItemType HistoryItem::type() const
+ {
+-    if (m_types & HistoryItemType::Url) {
++    // Prefer the visual image delegate whenever an item contains image data,
++    // even when clipboard providers also attach a filename/URL or text label.
++    // The complete MIME payload is preserved on copy regardless of this UI type.
++    if (m_types & HistoryItemType::Image) {
++        return HistoryItemType::Image;
++    } else if (m_types & HistoryItemType::Url) {
+         return HistoryItemType::Url;
+     } else if ((m_types & HistoryItemType::Text) && !m_text.isEmpty()) {
+         return HistoryItemType::Text;
+-    } else if (m_types & HistoryItemType::Image) {
+-        return HistoryItemType::Image;
+     }
+     return HistoryItemType::Text;
+ }
+diff --git a/klipper/historymodel.cpp b/klipper/historymodel.cpp
+index 992c5a5..076e8b3 100644
+--- a/klipper/historymodel.cpp
++++ b/klipper/historymodel.cpp
+@@ -26,6 +26,7 @@
+ #include <QSqlError>
+ #include <QSqlQuery>
+ #include <QStandardPaths>
++#include <QTemporaryFile>
+ #include <QThread>
+ #include <QtConcurrentRun>
+ 
+@@ -34,6 +35,7 @@
+ #include <KMessageBox>
+ 
+ #include "config-klipper.h"
++#include "clipboarddatafile.h"
+ #include "historyitem.h"
+ #include "klipper_debug.h"
+ #include "klippersettings.h"
+@@ -258,6 +260,7 @@ HistoryModel::HistoryModel()
+ 
+ HistoryModel::~HistoryModel()
+ {
++    clearDragExports();
+     if (!m_bKeepContents) {
+         m_db.close();
+         QFile(m_db.databaseName()).remove();
+@@ -452,12 +455,12 @@ QVariant HistoryModel::data(const QModelIndex &index, int role) const
+             if (item->isLocked()) {
+                 return QString();
+             }
+-            if (const QSize size = item->imageSize(); size.isValid() && item->text().isEmpty()) {
++            if (const QSize size = item->imageSize(); size.isValid() && (item->allTypes() & HistoryItemType::Image)) {
+                 return QString(u"▨ " + i18nc("@info:tooltip width x height", "%1x%2", QString::number(size.width()), QString::number(size.height())));
+             }
+             return item->text();
+         case ImageUrlRole:
+-            if (!item->isLocked() && item->imageSize().isValid() && item->text().isEmpty()) {
++            if (!item->isLocked() && (item->allTypes() & HistoryItemType::Image)) {
+                 // The QML image provider decrypts the preview into memory only. Do not
+                 // materialize an older image as a plaintext file on persistent storage.
+                 return QUrl(u"image://klippervaultpreview/"_s + item->uuid());
+@@ -466,9 +469,12 @@ QVariant HistoryModel::data(const QModelIndex &index, int role) const
+         case ImageSizeRole:
+             return item->imageSize();
+         case TypeRole:
+-            return QVariant::fromValue<HistoryItemType>(item->imageSize().isValid() && item->text().isEmpty() ? HistoryItemType::Image : HistoryItemType::Text);
++            return QVariant::fromValue<HistoryItemType>(item->type());
+         case TypeIntRole:
+-            return int(item->imageSize().isValid() && item->text().isEmpty() ? HistoryItemType::Image : HistoryItemType::Text);
++            // An encrypted file copied from a file manager is normally a URL
++            // entry (text/uri-list), not an image/png blob. Preserve its URL
++            // delegate across encryption so QML can keep showing file previews.
++            return int(item->type());
+         default:
+             break;
+         }
+@@ -479,7 +485,9 @@ QVariant HistoryModel::data(const QModelIndex &index, int role) const
+         if (item->type() == HistoryItemType::Image) {
+             QSqlQuery query(u"SELECT data_uuid FROM aux WHERE uuid='%1' AND (mimetype='%2')"_s.arg(item->uuid(), s_imageFormat), m_db);
+             if (query.exec() && query.isSelect() && query.next()) {
+-                QSize size = QImageReader(QString(m_dbFolder + u"/data/" + item->uuid() + u'/' + query.value(0).toString())).size();
++                const QString folder = m_dbFolder + u"/data/" + item->uuid();
++                const QString path = ClipboardDataFile::path(folder, query.value(0).toString(), QStringView(u"image/png"));
++                QSize size = QImageReader(path).size();
+                 return QString(u"▨ " + i18nc("@info:tooltip width x height", "%1x%2", QString::number(size.width()), QString::number(size.height())));
+             }
+         }
+@@ -491,7 +499,8 @@ QVariant HistoryModel::data(const QModelIndex &index, int role) const
+         }
+         QSqlQuery query(u"SELECT data_uuid FROM aux WHERE uuid='%1' AND (mimetype='%2')"_s.arg(item->uuid(), s_imageFormat), m_db);
+         if (query.exec() && query.isSelect() && query.next()) {
+-            return QUrl::fromLocalFile(m_dbFolder + u"/data/" + item->uuid() + u'/' + query.value(0).toString());
++            const QString folder = m_dbFolder + u"/data/" + item->uuid();
++            return QUrl::fromLocalFile(ClipboardDataFile::path(folder, query.value(0).toString(), QStringView(u"image/png")));
+         }
+         return QUrl();
+     }
+@@ -501,7 +510,8 @@ QVariant HistoryModel::data(const QModelIndex &index, int role) const
+         }
+         QSqlQuery query(u"SELECT data_uuid FROM aux WHERE uuid='%1' AND (mimetype='%2')"_s.arg(item->uuid(), s_imageFormat), m_db);
+         if (query.exec() && query.isSelect() && query.next()) {
+-            return QImageReader(m_dbFolder + u"/data/" + item->uuid() + u'/' + query.value(0).toString()).size();
++            const QString folder = m_dbFolder + u"/data/" + item->uuid();
++            return QImageReader(ClipboardDataFile::path(folder, query.value(0).toString(), QStringView(u"image/png"))).size();
+         }
+         return QSize();
+     }
+@@ -876,6 +886,7 @@ bool HistoryModel::loadHistory()
+     if (!m_vault.load(m_db)) {
+         qCWarning(KLIPPER_LOG) << "History encryption is unavailable";
+     }
++    migrateImageFileExtensions();
+     m_autoLockTimer.stop();
+ 
+     if (!m_bKeepContents) {
+@@ -940,6 +951,26 @@ bool HistoryModel::saveClipboardHistory()
+     return query.exec();
+ }
+ 
++void HistoryModel::migrateImageFileExtensions()
++{
++    if (!m_db.isOpen()) {
++        return;
++    }
++    QSqlQuery query(m_db);
++    query.prepare(u"SELECT uuid, data_uuid FROM aux WHERE mimetype=?"_s);
++    query.addBindValue(s_imageFormat.toString());
++    if (!query.exec()) {
++        return;
++    }
++    while (query.next()) {
++        const QString uuid = query.value(0).toString();
++        const QString dataUuid = query.value(1).toString();
++        if (!uuid.isEmpty() && !dataUuid.isEmpty()) {
++            ClipboardDataFile::migrateLegacyFile(dataFolder(uuid), dataUuid, QStringView(u"image/png"));
++        }
++    }
++}
++
+ void HistoryModel::loadSettings()
+ {
+     setMaxSize(KlipperSettings::maxClipItems());
+@@ -1030,11 +1061,12 @@ void HistoryModel::moveToTop(qsizetype row)
+     endMoveRows();
+ }
+ 
+-void HistoryModel::saveToFile(QStringView dbFolder, const QByteArray &data, QStringView newUuid, QStringView dataUuid)
++void HistoryModel::saveToFile(QStringView dbFolder, const QByteArray &data, QStringView newUuid, QStringView dataUuid, bool imageData)
+ {
+     const QString folderPath = dbFolder + u"/data/" + newUuid;
+     QDir().mkpath(folderPath);
+-    QSaveFile file(folderPath + u'/' + dataUuid);
++    const QString fileName = ClipboardDataFile::fileName(dataUuid, imageData ? QStringView(u"image/png") : QStringView());
++    QSaveFile file(folderPath + u'/' + fileName);
+     if (!file.open(QIODevice::WriteOnly)) {
+         qCWarning(KLIPPER_LOG) << file.errorString() << folderPath;
+         return;
+@@ -1287,6 +1319,103 @@ QByteArray HistoryModel::vaultImagePreviewData(const QString &uuid) const
+     return imageData;
+ }
+ 
++QUrl HistoryModel::imageFileUrlForDrag(const QString &uuid)
++{
++    // The drag handler is driven by QML on the model thread. Refuse calls from any
++    // other thread rather than racing the live row vector or SQLite connection.
++    if (QThread::currentThread() != thread()) {
++        return {};
++    }
++    const qsizetype row = indexOf(uuid);
++    if (row < 0) {
++        return {};
++    }
++    const HistoryItemPtr &item = m_items.at(row);
++    if (item->isLocked() || !(item->allTypes() & HistoryItemType::Image)) {
++        return {};
++    }
++
++    QByteArray imageData;
++    if (!item->isEncrypted()) {
++        QSqlQuery query(m_db);
++        query.prepare(u"SELECT data_uuid FROM aux WHERE uuid=? AND mimetype=?"_s);
++        query.addBindValue(item->uuid());
++        query.addBindValue(s_imageFormat.toString());
++        if (!query.exec() || !query.next()) {
++            return {};
++        }
++        const QString dataUuid = query.value(0).toString();
++        const QString folder = dataFolder(item->uuid());
++        ClipboardDataFile::migrateLegacyFile(folder, dataUuid, QStringView(u"image/png"));
++        const QString path = ClipboardDataFile::path(folder, dataUuid, QStringView(u"image/png"));
++        if (path.endsWith(u".png")) {
++            return QUrl::fromLocalFile(path);
++        }
++        QFile file(path);
++        if (!file.open(QIODevice::ReadOnly)) {
++            return {};
++        }
++        imageData = file.readAll();
++    } else {
++        // Encrypted payloads are never made persistently plaintext just to support
++        // file-path consumers. Materialize a short-lived private runtime PNG instead.
++        imageData = vaultImagePreviewData(item->uuid());
++    }
++    if (imageData.isEmpty() || QImage::fromData(imageData, "PNG").isNull()) {
++        HistoryVault::wipe(imageData);
++        return {};
++    }
++
++    const QString runtimePath = QStandardPaths::writableLocation(QStandardPaths::RuntimeLocation);
++    if (runtimePath.isEmpty()) {
++        HistoryVault::wipe(imageData);
++        return {};
++    }
++    const QString exportDir = runtimePath + u"/clipboard-vault-drag";
++    if (!QDir().mkpath(exportDir)) {
++        HistoryVault::wipe(imageData);
++        return {};
++    }
++    constexpr auto privatePermissions = QFileDevice::ReadOwner | QFileDevice::WriteOwner | QFileDevice::ExeOwner;
++    QFile::setPermissions(exportDir, privatePermissions);
++
++    QTemporaryFile file(exportDir + u"/image-XXXXXX.png"_s);
++    if (!file.open()) {
++        HistoryVault::wipe(imageData);
++        return {};
++    }
++    file.setPermissions(QFileDevice::ReadOwner | QFileDevice::WriteOwner);
++    if (file.write(imageData) != imageData.size() || !file.flush()) {
++        const QString failedPath = file.fileName();
++        file.close();
++        QFile::remove(failedPath);
++        HistoryVault::wipe(imageData);
++        return {};
++    }
++    const QString exportPath = file.fileName();
++    file.setAutoRemove(false);
++    file.close();
++    HistoryVault::wipe(imageData);
++    m_dragExportPaths.insert(exportPath);
++    return QUrl::fromLocalFile(exportPath);
++}
++
++void HistoryModel::releaseImageFileUrlForDrag(const QUrl &url)
++{
++    const QString path = url.toLocalFile();
++    if (!path.isEmpty() && m_dragExportPaths.remove(path)) {
++        QFile::remove(path);
++    }
++}
++
++void HistoryModel::clearDragExports()
++{
++    for (const QString &path : std::as_const(m_dragExportPaths)) {
++        QFile::remove(path);
++    }
++    m_dragExportPaths.clear();
++}
++
+ qsizetype HistoryModel::plaintextItems() const
+ {
+     return m_plaintextItems;
+@@ -1405,7 +1534,7 @@ bool HistoryModel::applyVault(const QList<qsizetype> &demoteRows, const QList<qs
+                 const QString dataUuid = query.value(1).toString();
+                 auxRows.emplace_back(mimeType, dataUuid);
+                 if (!blobs.contains(dataUuid)) {
+-                    QFile file(dataFolder(oldUuid) + u'/' + dataUuid);
++                    QFile file(ClipboardDataFile::path(dataFolder(oldUuid), dataUuid, mimeType));
+                     blobs.insert(dataUuid, file.open(QIODevice::ReadOnly) ? file.readAll() : QByteArray());
+                 }
+                 if (mimeType == s_imageFormat) {
+@@ -1492,8 +1621,14 @@ bool HistoryModel::applyVault(const QList<qsizetype> &demoteRows, const QList<qs
+             HistoryVault::wipe(*metaData);
+ 
+             const QString &contentUuid = meta->contentUuid;
++            QSet<QString> imageDataUuids;
++            for (const auto &[mimeType, dataUuid] : std::as_const(auxRows)) {
++                if (mimeType == s_imageFormat) {
++                    imageDataUuids.insert(dataUuid);
++                }
++            }
+             for (auto it = blobs.begin(); it != blobs.end(); ++it) {
+-                saveToFile(m_dbFolder, it.value(), contentUuid, it.key());
++                saveToFile(m_dbFolder, it.value(), contentUuid, it.key(), imageDataUuids.contains(it.key()));
+                 HistoryVault::wipe(it.value());
+             }
+             writtenFolders.append(dataFolder(contentUuid));
+@@ -1641,6 +1776,7 @@ void HistoryModel::unlockVault(const QString &password)
+ void HistoryModel::lockVault()
+ {
+     m_autoLockTimer.stop();
++    clearDragExports();
+     if (!m_vault.isUnlocked()) {
+         return;
+     }
+@@ -1688,6 +1824,7 @@ void HistoryModel::changeVaultPassword(const QString &oldPassword, const QString
+ 
+ void HistoryModel::resetVault()
+ {
++    clearDragExports();
+     if (!m_vault.isConfigured() || m_vaultBusy) {
+         return;
+     }
+diff --git a/klipper/historymodel.h b/klipper/historymodel.h
+index 27aade4..7f86cf2 100644
+--- a/klipper/historymodel.h
++++ b/klipper/historymodel.h
+@@ -14,6 +14,7 @@
+ #include <QSet>
+ #include <QSqlDatabase>
+ #include <QTimer>
++#include <QUrl>
+ 
+ #include "historyvault.h"
+ #include "klipper_export.h"
+@@ -121,6 +122,10 @@ public:
+     /// Returns a decrypted image payload for the QML preview provider. Safe to call from
+     /// an image-loading worker; SQLite access is marshalled back to the model thread.
+     QByteArray vaultImagePreviewData(const QString &uuid) const;
++    /// A real image file URL for drag/path consumers; encrypted items use a temporary PNG
++    /// under the private runtime directory and are removed by releaseImageFileUrlForDrag().
++    QUrl imageFileUrlForDrag(const QString &uuid);
++    void releaseImageFileUrlForDrag(const QUrl &url);
+     qsizetype plaintextItems() const;
+     /// Asynchronous; emits vaultOperationFinished(Setup, ok).
+     void setupVault(const QString &password);
+@@ -162,7 +167,7 @@ private:
+ 
+     void moveToTop(qsizetype row);
+ 
+-    static void saveToFile(QStringView dbFolder, const QByteArray &data, QStringView newUuid, QStringView dataUuid);
++    static void saveToFile(QStringView dbFolder, const QByteArray &data, QStringView newUuid, QStringView dataUuid, bool imageData = false);
+ 
+     void clearNonStarredHistory();
+ 
+@@ -182,6 +187,8 @@ private:
+     QString dataFolder(const QString &uuid) const;
+     void setVaultBusy(bool busy);
+     void restartAutoLock();
++    void migrateImageFileExtensions();
++    void clearDragExports();
+ 
+     std::shared_ptr<SystemClipboard> m_clip;
+     QList<std::shared_ptr<HistoryItem>> m_items;
+@@ -198,6 +205,7 @@ private:
+     bool m_bSelectionTextOnly = true;
+ 
+     HistoryVault m_vault;
++    QSet<QString> m_dragExportPaths;
+     QSet<QString> m_pendingWrites; ///< uuids whose UpdateDatabaseJob is still running
+     qsizetype m_plaintextItems = 5;
+     bool m_enforceScheduled = false;
+diff --git a/klipper/systemclipboard.cpp b/klipper/systemclipboard.cpp
+index d7745c4..152c929 100644
+--- a/klipper/systemclipboard.cpp
++++ b/klipper/systemclipboard.cpp
+@@ -9,6 +9,8 @@
+ 
+ #include "systemclipboard.h"
+ 
++#include "clipboarddatafile.h"
++
+ #include <chrono>
+ 
+ #include <QApplication>
+@@ -131,7 +133,8 @@ void DatabaseRecordToMimeDataJob::start()
+         if (mimeType.isEmpty() || dataUuid.isEmpty()) {
+             continue;
+         }
+-        const QString dataPath = QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation) + u"/klipper/data/" + m_uuid + u'/' + dataUuid;
++        const QString dataFolder = QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation) + u"/klipper/data/" + m_uuid;
++        const QString dataPath = ClipboardDataFile::path(dataFolder, dataUuid, mimeType);
+         auto job = KIO::open(QUrl::fromLocalFile(dataPath), QIODevice::ReadOnly);
+         connect(job, &KIO::FileJob::open, this, [this, job, mimeType] {
+             connect(job, &KIO::FileJob::data, this, [this, job, mimeType](KJob *, const QByteArray &data) {
+diff --git a/klipper/updateclipboardjob.cpp b/klipper/updateclipboardjob.cpp
+index 69a3d47..255a9cb 100644
+--- a/klipper/updateclipboardjob.cpp
++++ b/klipper/updateclipboardjob.cpp
+@@ -20,6 +20,8 @@
+ #include <KIO/StoredTransferJob>
+ #include <algorithm>
+ 
++#include "clipboarddatafile.h"
++
+ using namespace Qt::StringLiterals;
+ 
+ namespace
+@@ -178,8 +180,8 @@ void UpdateDatabaseJob::onDataDirReady(KJob *job)
+             // Different mimetypes can refer to the same content. Often happens between text/plain;charset=utf-8 and text/plain
+             if (QStringView uuid(data.uuid); !addedUuidList.contains(uuid)) {
+                 addedUuidList.insert(uuid);
+-                KIO::StoredTransferJob *fileJob =
+-                    KIO::storedPut(data.data, QUrl::fromLocalFile(QString(m_dataDir + m_uuid + u'/' + data.uuid)), -1, KIO::HideProgressInfo);
++                const QString fileName = ClipboardDataFile::fileName(data.uuid, data.type);
++                KIO::StoredTransferJob *fileJob = KIO::storedPut(data.data, QUrl::fromLocalFile(QString(m_dataDir + m_uuid + u'/' + fileName)), -1, KIO::HideProgressInfo);
+                 addSubjob(fileJob);
+             }
+         }
+-- 
+2.55.0
+

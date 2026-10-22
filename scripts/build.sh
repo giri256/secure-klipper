@@ -11,7 +11,8 @@
 #   config          klipperrc                         -> klippervaultrc (NoEmptyClipboard off by default)
 #   D-Bus           org.kde.klipper /klipper          -> org.kde.klippervault /klippervault
 #   shortcuts       action names prefixed "vault-", no default keys (Meta+V stays with Klipper)
-#   image provider  klipperpreview                    -> klippervaultpreview
+#   image provider  klipperpreview (URL/file thumbs)   -> klippervaulturlpreview
+#   encrypted image previews                           -> klippervaultpreview
 #   libklipper      shared library                    -> static, linked into the QML plugin
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
@@ -27,7 +28,12 @@ rm -rf "$src/klipper/autotests"
 cd "$src/klipper"
 # Names that would collide with the stock Klipper loaded in the same plasmashell process
 grep -rlZ --include='*.qml' --include='*.cpp' --include='*.h' --include='CMakeLists.txt' 'org.kde.plasma.private.clipboard\|org_kde_plasma_private_clipboard\|klipperpreview' . \
-  | xargs -0 sed -i 's/org\.kde\.plasma\.private\.clipboard/org.kde.plasma.private.clipboardvault/g; s/org_kde_plasma_private_clipboard/org_kde_plasma_private_clipboardvault/g; s/klipperpreview/klippervaultpreview/g'
+  | xargs -0 sed -i 's/org\.kde\.plasma\.private\.clipboard/org.kde.plasma.private.clipboardvault/g; s/org_kde_plasma_private_clipboard/org_kde_plasma_private_clipboardvault/g; s/klipperpreview/klippervaulturlpreview/g'
+# These providers must not collide: Qt replaces an existing image provider when the same key is registered.
+grep -q 'addImageProvider(QStringLiteral("klippervaulturlpreview"), new PreviewImageProvider)' declarative/klipperplugin.cpp || { echo 'Missing distinct URL thumbnail provider'; exit 1; }
+grep -q 'addImageProvider(QStringLiteral("klippervaultpreview"), new VaultPreviewImageProvider' declarative/klipperplugin.cpp || { echo 'Missing encrypted-image preview provider'; exit 1; }
+grep -q 'image://klippervaulturlpreview/' declarative/qml/UrlItemDelegate.qml || { echo 'URL delegate does not use its dedicated thumbnail provider'; exit 1; }
+grep -q 'image://klippervaultpreview/' historymodel.cpp || { echo 'Missing encrypted image preview URL'; exit 1; }
 sed -i 's/u"klipper"_s/u"klipper-vault"_s/g; s|u"/klipper"|u"/klipper-vault"|g; s|u"/klipper/data/"|u"/klipper-vault/data/"|g' historymodel.cpp systemclipboard.cpp
 sed -i 's/QStringLiteral("org\.kde\.klipper")/QStringLiteral("org.kde.klippervault")/; s|QStringLiteral("/klipper")|QStringLiteral("/klippervault")|' klipper.cpp
 sed -i 's/addAction(QStringLiteral("/addAction(QStringLiteral("vault-/g; s/QKeySequence(Qt::META | Qt::CTRL | Qt::Key_X)/QKeySequence()/; s/QKeySequence(Qt::META | Qt::Key_V)/QKeySequence()/' klipper.cpp

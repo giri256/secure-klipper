@@ -20,6 +20,8 @@
 #include <KIO/StoredTransferJob>
 #include <algorithm>
 
+#include "clipboarddatafile.h"
+
 using namespace Qt::StringLiterals;
 
 namespace
@@ -178,8 +180,8 @@ void UpdateDatabaseJob::onDataDirReady(KJob *job)
             // Different mimetypes can refer to the same content. Often happens between text/plain;charset=utf-8 and text/plain
             if (QStringView uuid(data.uuid); !addedUuidList.contains(uuid)) {
                 addedUuidList.insert(uuid);
-                KIO::StoredTransferJob *fileJob =
-                    KIO::storedPut(data.data, QUrl::fromLocalFile(QString(m_dataDir + m_uuid + u'/' + data.uuid)), -1, KIO::HideProgressInfo);
+                const QString fileName = ClipboardDataFile::fileName(data.uuid, data.type);
+                KIO::StoredTransferJob *fileJob = KIO::storedPut(data.data, QUrl::fromLocalFile(QString(m_dataDir + m_uuid + u'/' + fileName)), -1, KIO::HideProgressInfo);
                 addSubjob(fileJob);
             }
         }

@@ -8,6 +8,7 @@
 
 #include <QPropertyNotifier>
 #include <QSortFilterProxyModel>
+#include <QUrl>
 #include <qqmlregistration.h>
 
 class HistoryModel;
@@ -51,6 +52,8 @@ public:
     Q_INVOKABLE void clearHistory();
 
     Q_INVOKABLE void invokeAction(const QString &uuid);
+    Q_INVOKABLE QUrl imageFileUrlForDrag(const QString &uuid);
+    Q_INVOKABLE void releaseImageFileUrlForDrag(const QUrl &url);
 
     bool vaultConfigured() const;
     bool vaultUnlocked() const;

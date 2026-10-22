@@ -13,14 +13,37 @@ import org.kde.kirigami as Kirigami
 
 ClipboardItemDelegate {
     id: menuItem
+
+    // The thumbnail source is for painting only. In particular, an unlocked
+    // encrypted thumbnail uses image://, which cannot be consumed as a file URI.
+    // Prepare a real PNG path only while a drag is active, then release it.
+    property url dragImageUrl: ""
+
+    Connections {
+        target: menuItem.dragHandler
+        function onActiveChanged() {
+            const view = menuItem.ListView.view
+            const historyModel = view ? view.clipboardMenu.model : null
+            if (!historyModel) {
+                return
+            }
+            if (menuItem.dragHandler.active) {
+                menuItem.dragImageUrl = historyModel.imageFileUrlForDrag(menuItem.uuid)
+            } else if (menuItem.dragImageUrl.toString() !== "") {
+                historyModel.releaseImageFileUrlForDrag(menuItem.dragImageUrl)
+                menuItem.dragImageUrl = ""
+            }
+        }
+    }
+
     mainItem: Item {
         implicitHeight: childrenRect.height
 
-        Drag.active: menuItem.dragHandler.active
+        Drag.active: menuItem.dragHandler.active && menuItem.dragImageUrl.toString() !== ""
         Drag.dragType: Drag.Automatic
         Drag.supportedActions: Qt.CopyAction
         Drag.mimeData: {
-            "text/uri-list": [previewImage.source],
+            "text/uri-list": [menuItem.dragImageUrl.toString()],
         }
 
         Image {

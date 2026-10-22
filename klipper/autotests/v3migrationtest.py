@@ -84,9 +84,10 @@ class V3MigrationTest(unittest.TestCase):
             self.assertTrue(os.path.exists(target_db))
             self.assertTrue(os.path.exists(os.path.join(temp_dir, "data")))
             uuid = "8f9353dabfdcf9aca5a901cd2c4ae6717cac5adc"
+            image_path = os.path.join(temp_dir, "data", uuid, uuid + ".png")
             self.assertTrue(os.path.exists(os.path.join(temp_dir, "data", uuid)))
-            self.assertTrue(os.path.exists(os.path.join(temp_dir, "data", uuid, uuid)))
-            pixbuf = GdkPixbuf.Pixbuf.new_from_file(os.path.join(temp_dir, "data", uuid, uuid))
+            self.assertTrue(os.path.exists(image_path))
+            pixbuf = GdkPixbuf.Pixbuf.new_from_file(image_path)
             self.assertIsNotNone(pixbuf)
             self.assertEqual(pixbuf.get_width(), 1610)
             self.assertEqual(pixbuf.get_height(), 1329)

@@ -22,6 +22,7 @@
 #include <QSqlDatabase>
 #include <QSqlQuery>
 #include <QStandardPaths>
+#include <QTemporaryDir>
 #include <QTest>
 
 using namespace Qt::StringLiterals;
@@ -167,18 +168,57 @@ void HistoryVaultTest::testModelVault()
     QCOMPARE(history->plaintextItems(), 5);
     QVERIFY(!history->isVaultConfigured());
 
-    // Oldest first: an image, then 11 text entries. Newest is "secret-item-10".
+    // Oldest first: a binary image and a file URL, then 10 text entries.
+    // A file copied from a file manager is text/uri-list, not image/png.
     QImage image(10, 7, QImage::Format_RGB32);
     image.fill(Qt::red);
     auto imageData = std::make_unique<QMimeData>();
     imageData->setImageData(image);
+    // Screenshot/file producers often attach a filename or text/uri-list next to
+    // the binary image. It must still receive the image delegate and preview.
+    imageData->setText(u"clipboard-screenshot.png"_s);
     QVERIFY(history->insert(imageData.get()));
     QTRY_COMPARE(history->pendingJobs(), 0);
-    for (int i = 0; i <= 10; ++i) {
+
+    QTemporaryDir urlImageDirectory;
+    QVERIFY(urlImageDirectory.isValid());
+    const QString urlImagePath = urlImageDirectory.filePath(u"copied-file-preview.png"_s);
+    QImage urlImage(11, 8, QImage::Format_RGB32);
+    urlImage.fill(Qt::blue);
+    QVERIFY(urlImage.save(urlImagePath, "PNG"));
+    const QUrl urlImageUrl = QUrl::fromLocalFile(urlImagePath);
+    QMimeData urlImageData;
+    urlImageData.setUrls({urlImageUrl});
+    QVERIFY(history->insert(&urlImageData));
+    QTRY_COMPARE(history->pendingJobs(), 0);
+
+    for (int i = 0; i <= 9; ++i) {
         QVERIFY(history->insert(u"secret-item-%1"_s.arg(i, 2, 10, QLatin1Char('0'))));
         QTRY_COMPARE(history->pendingJobs(), 0);
     }
     QCOMPARE(history->rowCount(), 12);
+    // Image payloads have a format-bearing suffix for tools which consume file URIs.
+    // Older extensionless entries should be migrated when history is loaded.
+    QCOMPARE(history->index(11).data(HistoryModel::TypeIntRole).toInt(), int(HistoryItemType::Image));
+    QVERIFY(text(history.get(), 11).contains(u"10x7"_s));
+    const QString plainImageUuid = history->index(11).data(HistoryModel::UuidRole).toString();
+    QUrl plainImageUrl = history->index(11).data(HistoryModel::ImageUrlRole).toUrl();
+    QVERIFY(plainImageUrl.isLocalFile());
+    QVERIFY(plainImageUrl.toLocalFile().endsWith(u".png"));
+    QVERIFY(QFile::exists(plainImageUrl.toLocalFile()));
+    const QFileInfo plainImageInfo(plainImageUrl.toLocalFile());
+    const QString legacyImagePath = plainImageInfo.dir().filePath(plainImageInfo.completeBaseName());
+    QVERIFY(QFile::rename(plainImageUrl.toLocalFile(), legacyImagePath));
+    QVERIFY(!QFile::exists(plainImageUrl.toLocalFile()));
+    QVERIFY(history->loadHistory());
+    QCOMPARE(history->index(11).data(HistoryModel::UuidRole).toString(), plainImageUuid);
+    plainImageUrl = history->index(11).data(HistoryModel::ImageUrlRole).toUrl();
+    QVERIFY(plainImageUrl.toLocalFile().endsWith(u".png"));
+    QVERIFY(QFile::exists(plainImageUrl.toLocalFile()));
+    QCOMPARE(QImage(plainImageUrl.toLocalFile()).size(), QSize(10, 7));
+    const QString urlImageUuid = history->index(10).data(HistoryModel::UuidRole).toString();
+    QCOMPARE(history->index(10).data(HistoryModel::TypeIntRole).toInt(), int(HistoryItemType::Url));
+    QCOMPARE(text(history.get(), 10), urlImageUrl.toString(QUrl::FullyEncoded));
     // Without a vault nothing is encrypted
     QVERIFY(allStoredBytes().contains("secret-item-00"));
 
@@ -195,16 +235,32 @@ void HistoryVaultTest::testModelVault()
         QCOMPARE(history->index(row).data(HistoryModel::EncryptedRole).toBool(), row >= 5);
     }
     // Unlocked: encrypted entries still show their text (and the image its size)
-    QCOMPARE(text(history.get(), 5), u"secret-item-05"_s);
+    QCOMPARE(text(history.get(), 5), u"secret-item-04"_s);
     QCOMPARE(text(history.get(), 11), u"▨ 10x7"_s);
     QCOMPARE(history->index(11).data(HistoryModel::ImageSizeRole).toSize(), QSize(10, 7));
     QCOMPARE(history->index(11).data(HistoryModel::TypeIntRole).toInt(), int(HistoryItemType::Image));
+    const int encryptedUrlRow = history->indexOf(urlImageUuid);
+    QVERIFY(encryptedUrlRow >= 0);
+    QVERIFY(history->index(encryptedUrlRow).data(HistoryModel::EncryptedRole).toBool());
+    QCOMPARE(history->index(encryptedUrlRow).data(HistoryModel::TypeIntRole).toInt(), int(HistoryItemType::Url));
+    QCOMPARE(text(history.get(), encryptedUrlRow), urlImageUrl.toString(QUrl::FullyEncoded));
+    const QString encryptedUrlStorageUuid = history->index(encryptedUrlRow).data(HistoryModel::UuidRole).toString();
     const QString encryptedImageUuid = history->index(11).data(HistoryModel::UuidRole).toString();
     QCOMPARE(history->index(11).data(HistoryModel::ImageUrlRole).toUrl().scheme(), u"image"_s);
     QByteArray encryptedImagePreview = history->vaultImagePreviewData(encryptedImageUuid);
     QVERIFY(!encryptedImagePreview.isEmpty());
     QCOMPARE(QImage::fromData(encryptedImagePreview).size(), QSize(10, 7));
     HistoryVault::wipe(encryptedImagePreview);
+    const QUrl encryptedDragUrl = history->imageFileUrlForDrag(encryptedImageUuid);
+    QVERIFY(encryptedDragUrl.isLocalFile());
+    QVERIFY(encryptedDragUrl.toLocalFile().endsWith(u".png"));
+    QVERIFY(QFile::exists(encryptedDragUrl.toLocalFile()));
+    QCOMPARE(QImage(encryptedDragUrl.toLocalFile()).size(), QSize(10, 7));
+    const auto dragPermissions = QFileInfo(encryptedDragUrl.toLocalFile()).permissions();
+    QVERIFY(!(dragPermissions & (QFileDevice::ReadGroup | QFileDevice::WriteGroup | QFileDevice::ExeGroup |
+                                 QFileDevice::ReadOther | QFileDevice::WriteOther | QFileDevice::ExeOther)));
+    history->releaseImageFileUrlForDrag(encryptedDragUrl);
+    QVERIFY(!QFile::exists(encryptedDragUrl.toLocalFile()));
 
     // --- on disk: no plaintext of encrypted entries anywhere (db, WAL, data/)
     {
@@ -221,10 +277,11 @@ void HistoryVaultTest::testModelVault()
     }
     QCOMPARE(QDir(klipperFolder() + u"/data").entryList(QDir::Dirs | QDir::NoDotAndDotDot).size(), 5);
     const QByteArray onDisk = allStoredBytes();
-    for (int i = 0; i <= 10; ++i) {
+    for (int i = 0; i <= 9; ++i) {
         const QByteArray needle = u"secret-item-%1"_s.arg(i, 2, 10, QLatin1Char('0')).toUtf8();
-        QVERIFY2(onDisk.contains(needle) == (i >= 6), needle.constData()); // items 06..10 are the plain top 5
+        QVERIFY2(onDisk.contains(needle) == (i >= 5), needle.constData()); // items 05..09 are the plain top 5
     }
+    QVERIFY(!onDisk.contains(urlImageUrl.toString(QUrl::FullyEncoded).toUtf8())); // URL metadata is encrypted too
     // Encrypted rows don't reveal the content hash either
     QVERIFY(!onDisk.contains(QCryptographicHash::hash("secret-item-00", QCryptographicHash::Sha1).toHex()));
     QCOMPARE(QFileInfo(klipperFolder()).permissions() & (QFileDevice::ReadOther | QFileDevice::ReadGroup), QFileDevice::Permissions());
@@ -236,6 +293,11 @@ void HistoryVaultTest::testModelVault()
     QCOMPARE(history->lockedCount(), 7);
     QCOMPARE(history->index(11).data(HistoryModel::TypeIntRole).toInt(), int(HistoryItemType::Text));
     QVERIFY(history->index(11).data(HistoryModel::ImageUrlRole).toUrl().isEmpty());
+    QVERIFY(!history->imageFileUrlForDrag(encryptedImageUuid).isValid());
+    const int lockedUrlRow = history->indexOf(encryptedUrlStorageUuid);
+    QVERIFY(lockedUrlRow >= 0);
+    QVERIFY(history->index(lockedUrlRow).data(HistoryModel::LockedRole).toBool());
+    QCOMPARE(history->index(lockedUrlRow).data(HistoryModel::TypeIntRole).toInt(), int(HistoryItemType::Text));
     QVERIFY(history->index(8).data(HistoryModel::LockedRole).toBool());
     QCOMPARE(text(history.get(), 8), QString());
     {
@@ -262,7 +324,7 @@ void HistoryVaultTest::testModelVault()
         const QByteArray bytes = allStoredBytes();
         QVERIFY(bytes.contains("secret-item-11"));
         QVERIFY(!bytes.contains("secret-item-06"));
-        QVERIFY(!bytes.contains("secret-item-07"));
+        QVERIFY(!bytes.contains("secret-item-05"));
     }
 
     // --- unlock
@@ -279,6 +341,11 @@ void HistoryVaultTest::testModelVault()
     QCOMPARE(text(history.get(), 0), u"secret-item-01"_s);
     QCOMPARE(text(history.get(), 12), u"▨ 10x7"_s);
     QCOMPARE(history->index(12).data(HistoryModel::TypeIntRole).toInt(), int(HistoryItemType::Image));
+    const int unlockedUrlRow = history->indexOf(urlImageUuid);
+    QVERIFY(unlockedUrlRow >= 0);
+    QCOMPARE(history->index(unlockedUrlRow).data(HistoryModel::EncryptedRole).toBool(), true);
+    QCOMPARE(history->index(unlockedUrlRow).data(HistoryModel::TypeIntRole).toInt(), int(HistoryItemType::Url));
+    QCOMPARE(text(history.get(), unlockedUrlRow), urlImageUrl.toString(QUrl::FullyEncoded));
     QCOMPARE(history->index(12).data(HistoryModel::ImageUrlRole).toUrl().scheme(), u"image"_s);
     QByteArray unlockedImagePreview = history->vaultImagePreviewData(history->index(12).data(HistoryModel::UuidRole).toString());
     QVERIFY(!unlockedImagePreview.isEmpty());
@@ -292,6 +359,7 @@ void HistoryVaultTest::testModelVault()
     QCOMPARE(history->index(0).data(HistoryModel::TypeIntRole).toInt(), int(HistoryItemType::Image));
     const QUrl imageUrl = history->index(0).data(HistoryModel::ImageUrlRole).toUrl();
     QVERIFY(QFile::exists(imageUrl.toLocalFile()));
+    QVERIFY(imageUrl.toLocalFile().endsWith(u".png"));
     QCOMPARE(QImage(imageUrl.toLocalFile()).size(), QSize(10, 7));
     QTRY_VERIFY(history->index(5).data(HistoryModel::EncryptedRole).toBool()); // the displaced entry
     for (int row = 0; row < history->rowCount(); ++row) {

@@ -37,12 +37,15 @@ HistoryItem::~HistoryItem() = default;
 
 HistoryItemType HistoryItem::type() const
 {
-    if (m_types & HistoryItemType::Url) {
+    // Prefer the visual image delegate whenever an item contains image data,
+    // even when clipboard providers also attach a filename/URL or text label.
+    // The complete MIME payload is preserved on copy regardless of this UI type.
+    if (m_types & HistoryItemType::Image) {
+        return HistoryItemType::Image;
+    } else if (m_types & HistoryItemType::Url) {
         return HistoryItemType::Url;
     } else if ((m_types & HistoryItemType::Text) && !m_text.isEmpty()) {
         return HistoryItemType::Text;
-    } else if (m_types & HistoryItemType::Image) {
-        return HistoryItemType::Image;
     }
     return HistoryItemType::Text;
 }

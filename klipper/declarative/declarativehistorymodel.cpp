@@ -98,6 +98,16 @@ void DeclarativeHistoryModel::invokeAction(const QString &uuid)
     }
 }
 
+QUrl DeclarativeHistoryModel::imageFileUrlForDrag(const QString &uuid)
+{
+    return m_model->imageFileUrlForDrag(uuid);
+}
+
+void DeclarativeHistoryModel::releaseImageFileUrlForDrag(const QUrl &url)
+{
+    m_model->releaseImageFileUrlForDrag(url);
+}
+
 bool DeclarativeHistoryModel::vaultConfigured() const
 {
     return m_model->isVaultConfigured();

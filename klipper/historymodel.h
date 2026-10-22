@@ -14,6 +14,7 @@
 #include <QSet>
 #include <QSqlDatabase>
 #include <QTimer>
+#include <QUrl>
 
 #include "historyvault.h"
 #include "klipper_export.h"
@@ -121,6 +122,10 @@ public:
     /// Returns a decrypted image payload for the QML preview provider. Safe to call from
     /// an image-loading worker; SQLite access is marshalled back to the model thread.
     QByteArray vaultImagePreviewData(const QString &uuid) const;
+    /// A real image file URL for drag/path consumers; encrypted items use a temporary PNG
+    /// under the private runtime directory and are removed by releaseImageFileUrlForDrag().
+    QUrl imageFileUrlForDrag(const QString &uuid);
+    void releaseImageFileUrlForDrag(const QUrl &url);
     qsizetype plaintextItems() const;
     /// Asynchronous; emits vaultOperationFinished(Setup, ok).
     void setupVault(const QString &password);
@@ -162,7 +167,7 @@ private:
 
     void moveToTop(qsizetype row);
 
-    static void saveToFile(QStringView dbFolder, const QByteArray &data, QStringView newUuid, QStringView dataUuid);
+    static void saveToFile(QStringView dbFolder, const QByteArray &data, QStringView newUuid, QStringView dataUuid, bool imageData = false);
 
     void clearNonStarredHistory();
 
@@ -182,6 +187,8 @@ private:
     QString dataFolder(const QString &uuid) const;
     void setVaultBusy(bool busy);
     void restartAutoLock();
+    void migrateImageFileExtensions();
+    void clearDragExports();
 
     std::shared_ptr<SystemClipboard> m_clip;
     QList<std::shared_ptr<HistoryItem>> m_items;
@@ -198,6 +205,7 @@ private:
     bool m_bSelectionTextOnly = true;
 
     HistoryVault m_vault;
+    QSet<QString> m_dragExportPaths;
     QSet<QString> m_pendingWrites; ///< uuids whose UpdateDatabaseJob is still running
     qsizetype m_plaintextItems = 5;
     bool m_enforceScheduled = false;
